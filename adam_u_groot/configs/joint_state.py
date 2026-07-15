@@ -91,6 +91,45 @@ NECK_JOINT_NAMES: tuple[str, ...] = (
     "neckPitch",
 )
 
+BODY_JOINT_NAMES: tuple[str, ...] = (
+    *WAIST_JOINT_NAMES,
+    *NECK_JOINT_NAMES,
+    *LEFT_ARM_JOINT_NAMES,
+    *RIGHT_ARM_JOINT_NAMES,
+)
+
+# Six-channel Adam-U low-level hand interface.  Each flexion channel is a
+# hardware synergy, not one of the 12 individual URDF finger joints.
+HAND_COMMAND_NAMES: tuple[str, ...] = (
+    "thumb_opposition",
+    "thumb_flexion",
+    "index_flexion",
+    "middle_flexion",
+    "ring_flexion",
+    "pinky_flexion",
+)
+
+
+@lru_cache(maxsize=4)
+def parse_revolute_joint_limits(
+    urdf_path: str | Path = DEFAULT_URDF_PATH,
+) -> dict[str, tuple[float, float, float]]:
+    """Return ``name -> (lower_rad, upper_rad, velocity_rad_s)`` from the URDF."""
+    root = ET.parse(Path(urdf_path)).getroot()
+    limits: dict[str, tuple[float, float, float]] = {}
+    for joint in root.findall("joint"):
+        if joint.get("type") != "revolute" or not joint.get("name"):
+            continue
+        limit = joint.find("limit")
+        if limit is None:
+            raise ValueError(f"Revolute joint {joint.get('name')!r} has no URDF limit")
+        limits[joint.get("name")] = (
+            float(limit.get("lower")),
+            float(limit.get("upper")),
+            float(limit.get("velocity")),
+        )
+    return limits
+
 JOINT_GROUPS: dict[str, tuple[str, ...]] = {
     "waist": WAIST_JOINT_NAMES,
     "left_arm": LEFT_ARM_JOINT_NAMES,

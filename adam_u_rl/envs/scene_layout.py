@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 # Table geometry (table_top cuboid center + half-height = surface).
-# Adam-U faces -X, so the table sits 0.5 m in front of the robot.
-TABLE_X = -0.5
+# Adam-U faces -X. Keep the cube inside the fixed-waist arm workspace.
+TABLE_X = -0.50
 TABLE_Y = 0.0
 TABLE_TOP_POS = (TABLE_X, TABLE_Y, 1.0)
 TABLE_TOP_SIZE = (0.6, 0.5, 0.05)
@@ -22,13 +22,19 @@ ROBOT_POS = (0.0, 0.0, ROBOT_BASE_Z)
 ROBOT_ROT = (0.0, 0.0, 1.0, 0.0)
 
 # Manipulation targets on the table surface.
-OBJECT_POS = (TABLE_X, TABLE_Y, TABLE_SURFACE_Z + 0.025)  # 5 cm cube half-height
+# Place the cube 10 cm closer to the robot than the table center. Adam-U faces
+# -X, so a less-negative X coordinate is closer to its torso.
+OBJECT_POS = (TABLE_X + 0.10, TABLE_Y, TABLE_SURFACE_Z + 0.025)  # (-0.40, 0.0, 1.05)
 PLACE_TARGET_POS = (TABLE_X + 0.25, TABLE_Y + 0.15, TABLE_SURFACE_Z + 0.005)
 
 # Default viewer framing (robot at origin, table in front).
 VIEWER_EYE = (1.6, -0.85, 1.6)
-VIEWER_LOOKAT = (0.0, 0.35, 1.05)
+VIEWER_LOOKAT = (TABLE_X, TABLE_Y, TABLE_SURFACE_Z)
 
 # Front camera (world frame) for GR00T eval — third-person view of table and robot.
-FRONT_CAMERA_POS = (1.2, -0.65, 1.55)
-FRONT_CAMERA_ROT = (0.9238795, 0.0, 0.3826834, 0.0)  # look toward table
+FRONT_CAMERA_POS = (0.65, -0.85, 1.55)
+# This initial rotation only permits sensor creation.  eval_groot.py sets the
+# exact world-space look-at pose after the Camera has initialized, so moving the
+# table cannot silently leave the policy camera aimed at an obsolete location.
+FRONT_CAMERA_ROT = (1.0, 0.0, 0.0, 0.0)
+FRONT_CAMERA_LOOKAT = (TABLE_X, TABLE_Y, TABLE_SURFACE_Z + 0.08)

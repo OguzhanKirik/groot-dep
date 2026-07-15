@@ -22,6 +22,7 @@ from gr00t.data.types import (
 )
 
 ADAM_U_ACTION_HORIZON = 8
+ADAM_U_GROUPS = ["waist", "neck", "left_arm", "right_arm", "left_hand", "right_hand"]
 
 adam_u_config = {
     "video": ModalityConfig(
@@ -30,18 +31,21 @@ adam_u_config = {
     ),
     "state": ModalityConfig(
         delta_indices=[0],
-        modality_keys=["right_arm"],
+        modality_keys=ADAM_U_GROUPS,
     ),
     "action": ModalityConfig(
         delta_indices=list(range(ADAM_U_ACTION_HORIZON)),
-        modality_keys=["right_arm"],
+        modality_keys=ADAM_U_GROUPS,
         action_configs=[
+            # Native Adam-U low-level commands are absolute joint/synergy
+            # targets. Dataset actions must use radians for body joints and the
+            # calibrated dimensionless hand-synergy units.
             ActionConfig(
-                rep=ActionRepresentation.RELATIVE,
+                rep=ActionRepresentation.ABSOLUTE,
                 type=ActionType.NON_EEF,
                 format=ActionFormat.DEFAULT,
             ),
-        ],
+        ] * len(ADAM_U_GROUPS),
     ),
     "language": ModalityConfig(
         delta_indices=[0],

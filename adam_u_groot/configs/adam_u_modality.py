@@ -7,7 +7,7 @@ For finetune / server registration (requires ``lerobot-groot`` env), use:
 For LeRobot dataset layout, see ``adam_u_groot/configs/modality.json``.
 """
 
-from configs.constants import DEFAULT_EXECUTION_HORIZON, GROOT_ACTION_KEY, GROOT_STATE_KEY
+from configs.constants import DEFAULT_EXECUTION_HORIZON
 from configs.groot_schemas import ADAM_U_SCHEMA
 
 # Documented layout (matches ADAM_U_SCHEMA and modality.json).
@@ -33,7 +33,17 @@ ADAM_U_MODALITY_CONFIG = {
 LEROBOT_FEATURES = {
     "observation.images.front": {"dtype": "video", "shape": (256, 256, 3)},
     "observation.images.wrist": {"dtype": "video", "shape": (256, 256, 3)},
-    f"observation.state.{GROOT_STATE_KEY}": {"dtype": "float32", "shape": (7,)},
-    f"action.{GROOT_ACTION_KEY}": {"dtype": "float32", "shape": (7,)},
+    "observation.state.waist": {"dtype": "float32", "shape": (3,)},
+    "observation.state.neck": {"dtype": "float32", "shape": (2,)},
+    "observation.state.left_arm": {"dtype": "float32", "shape": (7,)},
+    "observation.state.right_arm": {"dtype": "float32", "shape": (7,)},
+    "observation.state.left_hand": {"dtype": "float32", "shape": (6,)},
+    "observation.state.right_hand": {"dtype": "float32", "shape": (6,)},
+    "action.waist": {"dtype": "float32", "shape": (3,)},
+    "action.neck": {"dtype": "float32", "shape": (2,)},
+    "action.left_arm": {"dtype": "float32", "shape": (7,)},
+    "action.right_arm": {"dtype": "float32", "shape": (7,)},
+    "action.left_hand": {"dtype": "float32", "shape": (6,)},
+    "action.right_hand": {"dtype": "float32", "shape": (6,)},
     "task": {"dtype": "string"},
 }

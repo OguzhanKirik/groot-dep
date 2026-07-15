@@ -48,8 +48,8 @@ parser.add_argument(
     "--mode",
     type=str,
     default="zero",
-    choices=["zero", "random", "groot"],
-    help="Policy mode: zero actions, random actions, or GR00T PolicyClient.",
+    choices=["zero", "random", "scripted_reach", "groot"],
+    help="Policy mode: zero, random, Jacobian-IK cube reach, or GR00T PolicyClient.",
 )
 parser.add_argument("--task", type=str, default="pick up the cube and place it on the green target", help="Language instruction for GR00T.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments.")
@@ -94,6 +94,40 @@ parser.add_argument(
         "GR00T I/O schema. 'real_g1' shims Adam-U obs to the base REAL_G1 checkpoint for pipeline tests. "
         "'adam_u' uses native keys and requires a finetuned NEW_EMBODIMENT checkpoint."
     ),
+)
+parser.add_argument(
+    "--groot-modality-config-path",
+    type=str,
+    default=os.path.join(_ADAM_U_GROOT_ROOT, "examples", "adam_u_modality_register.py"),
+    help="Python modality registration used by the native Adam-U NEW_EMBODIMENT checkpoint.",
+)
+parser.add_argument(
+    "--control-mode",
+    choices=["joint_space", "eef_space", "g1_real"],
+    default="joint_space",
+    help=(
+        "Arm control path. g1_real reproduces the former simulation-only right-arm "
+        "double-offset behavior and is unsafe for real hardware."
+    ),
+)
+parser.add_argument(
+    "--raw-relative-arm-actions",
+    action="store_true",
+    help="Treat received arm-joint commands as deltas. Leave off for PolicyClient-postprocessed outputs.",
+)
+parser.add_argument(
+    "--neck-neutral", nargs=2, type=float, default=(0.0, -0.35), metavar=("YAW", "PITCH"),
+    help="Held Adam-U neck pose in radians; negative pitch looks down toward the table.",
+)
+parser.add_argument("--max-position-step", type=float, default=0.10)
+parser.add_argument("--action-smoothing-alpha", type=float, default=1.0)
+parser.add_argument(
+    "--reach-hover-height", type=float, default=0.12,
+    help="Scripted reach target height in meters above the cube center.",
+)
+parser.add_argument(
+    "--reach-joint-step", type=float, default=0.03,
+    help="Maximum scripted IK change per right-arm joint and simulation step (radians).",
 )
 parser.add_argument(
     "--joint-state-group",
@@ -148,8 +182,11 @@ import torch
 from isaaclab.envs import ManagerBasedEnv
 
 from adapters.groot_adapter import GrootAdapter
+from adapters.adam_u_action_adapter import DampedLeastSquaresIKSolver
+from adapters.eef_pose import IsaacAdamUKinematicsProvider
 from adapters.joint_state_reader import JointStateReader
 from configs.constants import DEFAULT_TASK_INSTRUCTION
+from configs.adam_u_action_mapping import AdamUActionMappingConfig
 from configs.groot_schemas import GrootSchema, get_groot_schema
 from configs.joint_state import RIGHT_ARM_JOINT_NAMES
 
@@ -218,6 +255,24 @@ def _frame_viewport(env) -> None:
         env.sim.render()
 
 
+def _frame_front_camera(env) -> None:
+    """Aim the GR00T policy camera at the current task workspace."""
+    if "front_camera" not in env.scene.keys():
+        return
+    from envs.scene_layout import FRONT_CAMERA_LOOKAT, FRONT_CAMERA_POS
+
+    camera = env.scene["front_camera"]
+    eyes = torch.tensor([FRONT_CAMERA_POS], device=env.device, dtype=torch.float32)
+    targets = torch.tensor([FRONT_CAMERA_LOOKAT], device=env.device, dtype=torch.float32)
+    camera.set_world_poses_from_view(eyes, targets)
+    # Refresh the render product before the first GR00T observation is packed.
+    env.sim.render()
+    print(
+        f"[INFO] GR00T front camera eye={FRONT_CAMERA_POS}, lookat={FRONT_CAMERA_LOOKAT}",
+        flush=True,
+    )
+
+
 def _make_zero_action(env) -> torch.Tensor:
     return torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=env.device)
 
@@ -225,6 +280,40 @@ def _make_zero_action(env) -> torch.Tensor:
 def _make_random_action(env) -> torch.Tensor:
     return torch.empty(env.num_envs, env.action_manager.total_action_dim, device=env.device).uniform_(
         -0.05, 0.05
+    )
+
+
+def _make_scripted_reach_action(
+    env, adapter, provider, solver, hold_body: np.ndarray, hold_hands: np.ndarray
+) -> tuple[torch.Tensor, float, float]:
+    """Move only Adam-U's right arm toward a hover point above the cube."""
+    current_body = adapter._current_body()
+    current_right_arm = current_body[:, 12:19]
+    current_pose, _ = provider("right", current_right_arm)
+
+    object_pos_w = _to_numpy_array(env.scene["object"].data.root_pos_w)
+    env_origins = _to_numpy_array(env.scene.env_origins)
+    object_pos = object_pos_w - env_origins
+    target_pose = current_pose.copy()
+    target_pose[:, :3] = object_pos + np.asarray((0.0, 0.0, args_cli.reach_hover_height))
+    right_arm_target = solver.solve(
+        "right", target_pose, current_right_arm, command_is_relative=False
+    ).astype(np.float32)
+
+    # Keep every non-controlled joint at the pose captured immediately after
+    # reset. Following measured values would ratchet gravity/actuator drift into
+    # the next command and make the supposedly fixed body slowly collapse.
+    body_target = hold_body.copy()
+    body_target[:, 12:19] = right_arm_target
+    body_lower, body_upper, _ = AdamUActionMappingConfig().body_limits
+    body_target = np.clip(body_target, body_lower, body_upper).astype(np.float32)
+    sim_action = np.concatenate((body_target, hold_hands), axis=1)
+    current_distance = float(np.linalg.norm(current_pose[0, :3] - object_pos[0]))
+    hover_error = float(np.linalg.norm(current_pose[0, :3] - target_pose[0, :3]))
+    return (
+        torch.as_tensor(sim_action, device=env.device, dtype=torch.float32),
+        current_distance,
+        hover_error,
     )
 
 
@@ -298,6 +387,14 @@ def _load_groot_policy_remote(host: str, port: int):
 
 
 def _load_groot_policy_inprocess(model_path: str, embodiment_tag: str, device: str):
+    if args_cli.groot_schema == "adam_u":
+        config_path = os.path.abspath(args_cli.groot_modality_config_path)
+        spec = importlib.util.spec_from_file_location("adam_u_modality_register_runtime", config_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load Adam-U modality config: {config_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        print(f"[INFO] Registered native Adam-U modality config: {config_path}")
     from gr00t.data.embodiment_tags import EmbodimentTag
     from gr00t.policy.gr00t_policy import Gr00tPolicy
 
@@ -349,6 +446,8 @@ def _launch_groot_server_after_isaac(embodiment_tag: str) -> tuple[subprocess.Po
         "--device", "cuda:0",
         "--port", str(args_cli.groot_port),
     ]
+    if args_cli.groot_schema == "adam_u":
+        command.extend(("--modality-config-path", os.path.abspath(args_cli.groot_modality_config_path)))
     print("[INFO] Isaac is ready; starting the GR00T server now...", flush=True)
     process = subprocess.Popen(
         command,
@@ -377,6 +476,10 @@ def _launch_groot_server_after_isaac(embodiment_tag: str) -> tuple[subprocess.Po
 
 
 def main():
+    if args_cli.control_mode == "g1_real" and (
+        args_cli.mode != "groot" or args_cli.groot_schema != "real_g1"
+    ):
+        raise ValueError("--control-mode g1_real requires --mode groot --groot-schema real_g1")
     # GPU PhysX 110 intermittently blocks in initialize_physics() for the
     # high-link-count Adam-U articulation on this Isaac Sim 6/Blackwell setup.
     # A single evaluation environment does not benefit materially from the GPU
@@ -405,6 +508,10 @@ def main():
         num_envs=args_cli.num_envs,
         include_cameras=need_scene_cameras,
         include_wrist_camera=args_cli.groot_schema == "adam_u",
+        full_body_actions=(
+            args_cli.groot_schema in ("real_g1", "adam_u") and args_cli.control_mode != "g1_real"
+        ),
+        legacy_g1_real_actions=args_cli.control_mode == "g1_real",
     )
     env_cfg.sim.device = device
     # Resolve URDF path relative to the repo root.
@@ -437,12 +544,49 @@ def main():
         )
 
     groot_schema = get_groot_schema(args_cli.groot_schema)
+    action_mapping_config = AdamUActionMappingConfig(
+        control_mode="joint_space" if args_cli.control_mode == "g1_real" else args_cli.control_mode,
+        arm_commands_relative=args_cli.raw_relative_arm_actions,
+        neck_neutral=tuple(args_cli.neck_neutral),
+        max_body_position_step=args_cli.max_position_step,
+        max_hand_position_step=args_cli.max_position_step,
+        smoothing_alpha=args_cli.action_smoothing_alpha,
+        log_commands=args_cli.print_groot_actions,
+    )
+    ik_solver = None
+    if args_cli.groot_schema == "real_g1" and args_cli.control_mode == "eef_space":
+        ik_solver = DampedLeastSquaresIKSolver(
+            IsaacAdamUKinematicsProvider(env),
+            damping=0.05,
+            max_joint_delta=min(args_cli.max_position_step, 0.10),
+        )
+        print("[INFO] Adam-U EEF control enabled: GR00T arm joints will be ignored.", flush=True)
     adapter = GrootAdapter(
         env,
         task_instruction=args_cli.task or DEFAULT_TASK_INSTRUCTION,
         execution_horizon=args_cli.execution_horizon,
         schema=groot_schema,
+        action_mapping_config=action_mapping_config,
+        ik_solver=ik_solver,
+        legacy_g1_real=args_cli.control_mode == "g1_real",
     )
+    if args_cli.control_mode == "g1_real":
+        print(
+            "[WARN] g1_real compatibility mode: right arm only, default pose offset intentionally added; "
+            "SIMULATION ONLY.",
+            flush=True,
+        )
+    scripted_provider = None
+    scripted_solver = None
+    if args_cli.mode == "scripted_reach":
+        scripted_provider = IsaacAdamUKinematicsProvider(env)
+        scripted_solver = DampedLeastSquaresIKSolver(
+            scripted_provider, damping=0.05, max_joint_delta=args_cli.reach_joint_step
+        )
+        print(
+            "[INFO] Scripted reach enabled: only the right arm is controlled; GR00T is not loaded.",
+            flush=True,
+        )
     joint_state_reader = JointStateReader(env, group=args_cli.joint_state_group)
 
     groot_policy = None
@@ -472,6 +616,19 @@ def main():
             )
 
     env.reset()
+    _frame_front_camera(env)
+    scripted_hold_body = None
+    scripted_hold_hands = None
+    if args_cli.mode == "scripted_reach":
+        scripted_hold_body = adapter._current_body().copy()
+        scripted_hold_hands = np.concatenate(
+            (
+                adapter._left_hand_state.get_positions().detach().cpu().numpy(),
+                adapter._right_hand_state.get_positions().detach().cpu().numpy(),
+            ),
+            axis=1,
+        ).astype(np.float32)
+        print("[INFO] Latched fixed targets for waist, neck, left arm, and both hands.", flush=True)
     dt = env.step_dt
     print(f"[INFO] Running eval mode='{args_cli.mode}' for up to {args_cli.max_steps} steps.")
 
@@ -491,6 +648,15 @@ def main():
                 actions = _make_zero_action(env)
             elif args_cli.mode == "random":
                 actions = _make_random_action(env)
+            elif args_cli.mode == "scripted_reach":
+                actions, wrist_cube_distance, hover_error = _make_scripted_reach_action(
+                    env,
+                    adapter,
+                    scripted_provider,
+                    scripted_solver,
+                    scripted_hold_body,
+                    scripted_hold_hands,
+                )
             else:
                 if groot_action is None or chunk_index >= adapter.get_execution_horizon(groot_action):
                     obs_groot = adapter.build_observation()
@@ -519,6 +685,12 @@ def main():
             obj_pos = _to_numpy_array(env.scene["object"].data.root_pos_w)
             obj_z = float(obj_pos[0, 2] if obj_pos.ndim >= 2 else obj_pos[2])
             print(f"[INFO] step={step}, object height={obj_z:.3f}")
+            if args_cli.mode == "scripted_reach":
+                print(
+                    f"[REACH] right wrist-to-cube={wrist_cube_distance:.3f} m, "
+                    f"hover-target error={hover_error:.3f} m",
+                    flush=True,
+                )
             if args_cli.print_joint_states:
                 joint_dict = joint_state_reader.as_dict(env_index=0)
                 joint_line = ", ".join(f"{name}={value:.4f}" for name, value in joint_dict.items())

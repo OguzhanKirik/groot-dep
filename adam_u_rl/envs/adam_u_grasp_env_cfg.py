@@ -219,19 +219,20 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
                 "wristPitch_Right": -0.1,
                 "wristRoll_Right": 0.0,
                 
-                # 左臂保持下垂
-                "shoulderPitch_Left": 0.0,
-                "shoulderRoll_Left": 0.0,
+                # 左臂镜像抓取准备姿势，确保双手位于前置相机视野内
+                "shoulderPitch_Left": 0.3,
+                "shoulderRoll_Left": 0.1,
                 "shoulderYaw_Left": 0.0,
-                # "elbow_Left": -0.5,
-                "elbow_Left": 0.0,
+                "elbow_Left": -0.8,
                 "wristYaw_Left": 0.0,
-                "wristPitch_Left": 0.0,
+                "wristPitch_Left": -0.1,
                 "wristRoll_Left": 0.0,
                 
                 # 头部和手指关节
                 "neckYaw": 0.0,
-                "neckPitch": 0.0,
+                # Verified in the imported articulation: negative pitch looks
+                # down toward the tabletop.
+                "neckPitch": -0.35,
                 # 手指关节设为默认值
                 ".*thumb.*": 0.0,
                 ".*index.*": 0.0,
@@ -550,13 +551,15 @@ class EventsCfg:
         },
     )
     
-    # 重置时随机化机器人右臂关节位置
+    # Deterministic reset for GR00T/IK comparisons. Domain randomization belongs
+    # in training configs, not evaluation, because it also perturbs fingers,
+    # waist, neck, and the supposedly fixed arm-ready pose.
     reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
-            "position_range": (-0.1, 0.1),
-            "velocity_range": (-0.05, 0.05),
+            "position_range": (0.0, 0.0),
+            "velocity_range": (0.0, 0.0),
         },
     )
 

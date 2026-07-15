@@ -64,6 +64,7 @@ from configs.constants import (
     RIGHT_ARM_JOINT_NAMES,
     WRIST_CAMERA_NAME,
 )
+from configs.joint_state import BODY_JOINT_NAMES, LEFT_HAND_JOINT_NAMES, RIGHT_HAND_JOINT_NAMES
 from envs.scene_layout import (
     FRONT_CAMERA_POS,
     FRONT_CAMERA_ROT,
@@ -167,12 +168,55 @@ class AdamUGraspGrootSceneNoCamCfg(AdamUGraspSceneCfg):
 
 @configclass
 class GrootActionsCfg:
-    """Right-arm joint targets only (minimal GR00T control)."""
+    """Absolute Adam-U targets: body[19], expanded left hand[12], right hand[12]."""
+
+    body = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=list(BODY_JOINT_NAMES),
+        preserve_order=True,
+        scale=1.0,
+        use_default_offset=False,
+    )
+    left_hand = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=list(LEFT_HAND_JOINT_NAMES),
+        preserve_order=True,
+        scale=1.0,
+        use_default_offset=False,
+    )
+    right_hand = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=list(RIGHT_HAND_JOINT_NAMES),
+        preserve_order=True,
+        scale=1.0,
+        use_default_offset=False,
+    )
+
+
+@configclass
+class GrootRightArmActionsCfg:
+    """Legacy seven-joint action space for a native Adam-U right-arm checkpoint."""
 
     right_arm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=list(RIGHT_ARM_JOINT_NAMES),
+        preserve_order=True,
         scale=1.0,
+        use_default_offset=False,
+    )
+
+
+@configclass
+class GrootLegacyG1RightArmActionsCfg:
+    """Simulation-only reproduction of the former G1 right-arm command path."""
+
+    right_arm = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=list(RIGHT_ARM_JOINT_NAMES),
+        preserve_order=True,
+        scale=1.0,
+        # Intentionally reproduces the old double-offset behavior for A/B
+        # diagnosis. Never use this controller for real-robot deployment.
         use_default_offset=True,
     )
 
@@ -234,6 +278,8 @@ def make_groot_env_cfg(
     env_spacing: float = 4.0,
     include_cameras: bool = True,
     include_wrist_camera: bool = True,
+    full_body_actions: bool = True,
+    legacy_g1_real_actions: bool = False,
 ):
     """Build env cfg; omit scene cameras for zero/random viewport-only runs."""
     cfg = AdamUGraspGrootEnvCfg()
@@ -247,6 +293,10 @@ def make_groot_env_cfg(
         cfg.scene.replicate_physics = False
     else:
         cfg.scene = AdamUGraspGrootSceneNoCamCfg(num_envs=num_envs, env_spacing=env_spacing)
+    if legacy_g1_real_actions:
+        cfg.actions = GrootLegacyG1RightArmActionsCfg()
+    elif not full_body_actions:
+        cfg.actions = GrootRightArmActionsCfg()
     return cfg
 
 

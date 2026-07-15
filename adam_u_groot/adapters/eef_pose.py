@@ -16,6 +16,58 @@ _WRIST_BODY_NAMES = {
 }
 
 
+class IsaacAdamUKinematicsProvider:
+    """Expose Adam-U wrist FK and arm Jacobians in the environment world frame."""
+
+    def __init__(self, env) -> None:
+        from configs.joint_state import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
+
+        self.env = env
+        self.robot = env.scene["robot"]
+        self._body_indices = {}
+        for side, body_name in _WRIST_BODY_NAMES.items():
+            if body_name not in self.robot.data.body_names:
+                raise ValueError(f"Adam-U EEF body {body_name!r} is missing from the articulation")
+            self._body_indices[side] = self.robot.data.body_names.index(body_name)
+        self._joint_indices = {
+            "left": [self.robot.data.joint_names.index(name) for name in LEFT_ARM_JOINT_NAMES],
+            "right": [self.robot.data.joint_names.index(name) for name in RIGHT_ARM_JOINT_NAMES],
+        }
+
+    @staticmethod
+    def _torch(value):
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            return value
+        try:
+            return torch.utils.dlpack.from_dlpack(value)
+        except (TypeError, RuntimeError):
+            return torch.as_tensor(value.numpy())
+
+    def __call__(self, side: str, current_arm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        import torch
+
+        if side not in self._body_indices:
+            raise ValueError(f"Unknown Adam-U arm side: {side!r}")
+        body_idx = self._body_indices[side]
+        jacobian_body_idx = body_idx - 1 if self.robot.is_fixed_base else body_idx
+        jacobians = self._torch(self.robot.root_view.get_jacobians())
+        joint_ids = torch.as_tensor(self._joint_indices[side], dtype=torch.long, device=jacobians.device)
+        jacobian = torch.index_select(jacobians[:, jacobian_body_idx], dim=2, index=joint_ids)
+
+        body_pos_w = self._torch(self.robot.data.body_pos_w)[:, body_idx]
+        body_quat_w = self._torch(self.robot.data.body_quat_w)[:, body_idx]
+        env_origins = self._torch(self.env.scene.env_origins)
+        pos = (body_pos_w - env_origins).detach().cpu().numpy()
+        quat = body_quat_w.detach().cpu().numpy()
+        pose = build_eef_9d(pos, quat).astype(np.float64)
+        jacobian_np = jacobian.detach().cpu().numpy().astype(np.float64)
+        if pose.shape[0] != np.asarray(current_arm).shape[0]:
+            raise ValueError("Adam-U FK batch does not match current arm state")
+        return pose, jacobian_np
+
+
 def quat_wxyz_to_rot6d(quat_wxyz: np.ndarray) -> np.ndarray:
     """Convert wxyz quaternion(s) to rot6d (first two rows of R, flattened)."""
     quat = np.asarray(quat_wxyz, dtype=np.float64)
