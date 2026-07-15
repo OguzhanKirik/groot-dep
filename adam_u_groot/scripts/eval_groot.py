@@ -111,6 +111,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--execution-scope",
+    choices=["right_arm_hand", "full"],
+    default="right_arm_hand",
+    help=(
+        "Which GR00T outputs reach Adam-U. right_arm_hand holds waist, neck, left arm, "
+        "and left hand at their reset targets while still observing their full state."
+    ),
+)
+parser.add_argument(
     "--raw-relative-arm-actions",
     action="store_true",
     help="Treat received arm-joint commands as deltas. Leave off for PolicyClient-postprocessed outputs.",
@@ -128,6 +137,10 @@ parser.add_argument(
 parser.add_argument(
     "--reach-joint-step", type=float, default=0.03,
     help="Maximum scripted IK change per right-arm joint and simulation step (radians).",
+)
+parser.add_argument(
+    "--reach-ik-backend", choices=["custom", "isaac"], default="isaac",
+    help="IK implementation for scripted_reach; isaac is the trusted baseline.",
 )
 parser.add_argument(
     "--joint-state-group",
@@ -183,12 +196,18 @@ from isaaclab.envs import ManagerBasedEnv
 
 from adapters.groot_adapter import GrootAdapter
 from adapters.adam_u_action_adapter import DampedLeastSquaresIKSolver
-from adapters.eef_pose import IsaacAdamUKinematicsProvider
+from adapters.eef_pose import (
+    G1AdamWorkspaceTransform,
+    IsaacAdamUKinematicsProvider,
+    IsaacDifferentialIKSolver,
+)
 from adapters.joint_state_reader import JointStateReader
+from adapters.virtual_g1_state import VirtualG1StateAdapter
 from configs.constants import DEFAULT_TASK_INSTRUCTION
 from configs.adam_u_action_mapping import AdamUActionMappingConfig
 from configs.groot_schemas import GrootSchema, get_groot_schema
 from configs.joint_state import RIGHT_ARM_JOINT_NAMES
+from envs.scene_layout import TABLE_SURFACE_Z
 
 AdamUGraspGrootEnvCfg, make_groot_env_cfg = _load_groot_env_cfg_class()
 
@@ -554,13 +573,23 @@ def main():
         log_commands=args_cli.print_groot_actions,
     )
     ik_solver = None
+    workspace_transform = G1AdamWorkspaceTransform()
+    virtual_g1_state = VirtualG1StateAdapter() if args_cli.groot_schema == "real_g1" else None
     if args_cli.groot_schema == "real_g1" and args_cli.control_mode == "eef_space":
-        ik_solver = DampedLeastSquaresIKSolver(
+        ik_solver = IsaacDifferentialIKSolver(
             IsaacAdamUKinematicsProvider(env),
-            damping=0.05,
             max_joint_delta=min(args_cli.max_position_step, 0.10),
+            # G1 and Adam-U wrist/tool axes have not been calibrated yet.
+            # Position control is safe after workspace conversion; pose control
+            # would make IK chase an unknown tool-frame rotation offset.
+            command_type="position",
+            workspace_transform=workspace_transform,
         )
-        print("[INFO] Adam-U EEF control enabled: GR00T arm joints will be ignored.", flush=True)
+        print(
+            "[INFO] Adam-U EEF control enabled: G1-canonical <-> Adam-world conversion, "
+            "Isaac position IK, and persistent joint targets; GR00T arm joints will be ignored.",
+            flush=True,
+        )
     adapter = GrootAdapter(
         env,
         task_instruction=args_cli.task or DEFAULT_TASK_INSTRUCTION,
@@ -569,7 +598,16 @@ def main():
         action_mapping_config=action_mapping_config,
         ik_solver=ik_solver,
         legacy_g1_real=args_cli.control_mode == "g1_real",
+        workspace_transform=workspace_transform,
+        virtual_g1_state=virtual_g1_state,
+        execution_scope=args_cli.execution_scope,
     )
+    if args_cli.execution_scope == "right_arm_hand":
+        print(
+            "[INFO] Execution scope=right_arm_hand: waist, neck, left arm, and left hand "
+            "will hold their post-reset targets; full state is still sent to GR00T.",
+            flush=True,
+        )
     if args_cli.control_mode == "g1_real":
         print(
             "[WARN] g1_real compatibility mode: right arm only, default pose offset intentionally added; "
@@ -580,11 +618,17 @@ def main():
     scripted_solver = None
     if args_cli.mode == "scripted_reach":
         scripted_provider = IsaacAdamUKinematicsProvider(env)
-        scripted_solver = DampedLeastSquaresIKSolver(
-            scripted_provider, damping=0.05, max_joint_delta=args_cli.reach_joint_step
-        )
+        if args_cli.reach_ik_backend == "isaac":
+            scripted_solver = IsaacDifferentialIKSolver(
+                scripted_provider, max_joint_delta=args_cli.reach_joint_step
+            )
+        else:
+            scripted_solver = DampedLeastSquaresIKSolver(
+                scripted_provider, damping=0.05, max_joint_delta=args_cli.reach_joint_step
+            )
         print(
-            "[INFO] Scripted reach enabled: only the right arm is controlled; GR00T is not loaded.",
+            f"[INFO] Scripted reach enabled: right arm only, IK backend={args_cli.reach_ik_backend}; "
+            "GR00T is not loaded.",
             flush=True,
         )
     joint_state_reader = JointStateReader(env, group=args_cli.joint_state_group)
@@ -628,6 +672,19 @@ def main():
             ),
             axis=1,
         ).astype(np.float32)
+        initial_wrist_pose, _ = scripted_provider("right", scripted_hold_body[:, 12:19])
+        wrist_z = float(initial_wrist_pose[0, 2])
+        clearance = wrist_z - float(TABLE_SURFACE_Z)
+        print(
+            f"[REACH] initial right wrist xyz={initial_wrist_pose[0, :3]}, "
+            f"table clearance={clearance:.3f} m",
+            flush=True,
+        )
+        if clearance <= 0.0:
+            raise RuntimeError(
+                "Right wrist reset pose is not above the tabletop; "
+                f"clearance={clearance:.3f} m"
+            )
         print("[INFO] Latched fixed targets for waist, neck, left arm, and both hands.", flush=True)
     dt = env.step_dt
     print(f"[INFO] Running eval mode='{args_cli.mode}' for up to {args_cli.max_steps} steps.")

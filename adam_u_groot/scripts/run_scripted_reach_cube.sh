@@ -10,5 +10,6 @@ python adam_u_groot/scripts/eval_groot.py \
   --gui \
   --max_steps "${MAX_STEPS:-500}" \
   --reach-hover-height "${REACH_HOVER_HEIGHT:-0.12}" \
-  --reach-joint-step "${REACH_JOINT_STEP:-0.03}" \
+  --reach-joint-step "${REACH_JOINT_STEP:-0.01}" \
+  --reach-ik-backend "${REACH_IK_BACKEND:-isaac}" \
   "$@"

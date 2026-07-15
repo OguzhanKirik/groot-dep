@@ -13,6 +13,13 @@ checkpoint processor configuration, and inference must retain this exact
 layout. `examples/adam_u_modality_register.py` is the authoritative GR00T
 registration and `configs/modality.json` defines matching LeRobot ranges.
 
+For REAL_G1 compatibility, Adam-U arm angles are never inserted directly into
+the G1 state fields. `VirtualG1StateAdapter` uses the official Unitree G1 URDF
+and Pinocchio IK to find continuous virtual G1 arm angles whose wrist positions
+match the transformed Adam-U wrist positions. Each solve is seeded from the
+previous virtual state to avoid elbow flips. Thus the G1 joint and EEF states
+fed to GR00T describe the same virtual configuration.
+
 This integration treats the GR00T action dictionary as named groups. It never
 concatenates outputs based only on matching dimensions.
 
@@ -70,12 +77,12 @@ by name into thumb and MCP/DIP targets.
 
 - `joint_space`: consumes `left_arm` and `right_arm`; wrist EEF actions are logged
   as ignored.
-- `eef_space`: consumes only the wrist EEF actions. A damped-least-squares IK
-  solver uses Isaac's Adam-U wrist poses and 6x7 articulation Jacobians to
-  produce seven absolute targets per arm. `Gr00tPolicy` has already decoded the
-  model's relative prediction into an absolute pose using the supplied wrist
-  state, so the adapter does not add the current pose twice. The adapter refuses
-  to start EEF mode without an IK provider and never falls back to joint actions.
+- `eef_space`: consumes only the wrist EEF actions. Adam world poses are mapped
+  to the REAL_G1 canonical workspace as `[-x, -y, z - 1]` before policy input,
+  and returned absolute targets are mapped back before Isaac differential IK.
+  IK currently controls position only because the G1-to-Adam wrist/tool-frame
+  rotation has not been calibrated. Persistent joint targets resist gravity
+  sag. The adapter refuses to start without IK and never falls back to joints.
 - `g1_real`: simulation-only diagnostic that reproduces the pre-adapter path:
   only `right_arm[7]` is applied and Isaac intentionally adds Adam-U's default
   right-arm pose. It ignores all other outputs and must never be used on real
@@ -83,6 +90,11 @@ by name into thumb and MCP/DIP targets.
 
 Navigation and base height are always ignored because this integration controls
 a fixed upper body. Neck joints hold the configurable neutral pose.
+
+The default execution scope is `right_arm_hand`: GR00T still observes the full
+REAL_G1-compatible state, but only the right EEF/right arm and right hand are
+executed. Waist, neck, left arm, and left hand are latched after reset. Use
+`--execution-scope full` only for deliberate bimanual experiments.
 
 ## Safety
 

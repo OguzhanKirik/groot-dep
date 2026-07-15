@@ -6,12 +6,12 @@ from __future__ import annotations
 # Adam-U faces -X. Keep the cube inside the fixed-waist arm workspace.
 TABLE_X = -0.50
 TABLE_Y = 0.0
-TABLE_TOP_POS = (TABLE_X, TABLE_Y, 1.0)
+TABLE_TOP_POS = (TABLE_X, TABLE_Y, 0.85)
 TABLE_TOP_SIZE = (0.6, 0.5, 0.05)
-TABLE_SURFACE_Z = TABLE_TOP_POS[2] + TABLE_TOP_SIZE[2] * 0.5  # 1.025 m
+TABLE_SURFACE_Z = TABLE_TOP_POS[2] + TABLE_TOP_SIZE[2] * 0.5  # 0.875 m
 
-TABLE_LEG_POS = (TABLE_X, TABLE_Y, 0.5)
-TABLE_LEG_HEIGHT = 1.0
+TABLE_LEG_HEIGHT = TABLE_TOP_POS[2]
+TABLE_LEG_POS = (TABLE_X, TABLE_Y, TABLE_LEG_HEIGHT * 0.5)
 
 # URDF root (lifting_Columns) sits above the feet; lift so lowest geometry clears z=0 floor.
 ROBOT_BASE_Z = 1.00
@@ -24,12 +24,14 @@ ROBOT_ROT = (0.0, 0.0, 1.0, 0.0)
 # Manipulation targets on the table surface.
 # Place the cube 10 cm closer to the robot than the table center. Adam-U faces
 # -X, so a less-negative X coordinate is closer to its torso.
-OBJECT_POS = (TABLE_X + 0.10, TABLE_Y, TABLE_SURFACE_Z + 0.025)  # (-0.40, 0.0, 1.05)
+OBJECT_POS = (TABLE_X + 0.10, TABLE_Y, TABLE_SURFACE_Z + 0.025)  # (-0.40, 0.0, 0.90)
 PLACE_TARGET_POS = (TABLE_X + 0.25, TABLE_Y + 0.15, TABLE_SURFACE_Z + 0.005)
 
 # Default viewer framing (robot at origin, table in front).
-VIEWER_EYE = (1.6, -0.85, 1.6)
-VIEWER_LOOKAT = (TABLE_X, TABLE_Y, TABLE_SURFACE_Z)
+# GUI viewport from the far side of the table, looking back toward Adam-U.
+# This does not change the separate front-camera sensor supplied to GR00T.
+VIEWER_EYE = (-1.2, 0.9, 1.5)
+VIEWER_LOOKAT = (-0.25, 0.0, TABLE_SURFACE_Z + 0.08)
 
 # Front camera (world frame) for GR00T eval — third-person view of table and robot.
 FRONT_CAMERA_POS = (0.65, -0.85, 1.55)

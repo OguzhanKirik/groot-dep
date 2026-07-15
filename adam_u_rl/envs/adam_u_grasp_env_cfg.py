@@ -210,13 +210,14 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
                 "waistPitch": 0.0,
                 "waistYaw": 0.0,
                 
-                # 右臂初始姿势 - 调整为抓取准备姿势
-                "shoulderPitch_Right": 0.3,
-                "shoulderRoll_Right": -0.1,
+                # Right-arm pre-grasp pose: forward, elbow bent, and wrist
+                # pitched toward the lowered tabletop.
+                "shoulderPitch_Right": -0.20,
+                "shoulderRoll_Right": 0.20,
                 "shoulderYaw_Right": 0.0,
-                "elbow_Right": -0.8,
+                "elbow_Right": -1.10,
                 "wristYaw_Right": 0.0,
-                "wristPitch_Right": -0.1,
+                "wristPitch_Right": -0.30,
                 "wristRoll_Right": 0.0,
                 
                 # 左臂镜像抓取准备姿势，确保双手位于前置相机视野内

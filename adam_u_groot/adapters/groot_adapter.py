@@ -7,13 +7,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from adapters.eef_pose import IDENTITY_EEF_9D, read_wrist_eef_9d
+from adapters.eef_pose import G1AdamWorkspaceTransform, IDENTITY_EEF_9D, read_wrist_eef_9d
 from adapters.adam_u_action_adapter import (
     AdamUCommand,
     RealG1ToAdamUAdapter,
     expand_hand_synergies_for_isaac,
 )
 from adapters.joint_state_reader import JointStateReader, make_right_arm_reader
+from adapters.virtual_g1_state import VirtualG1StateAdapter
 from configs.adam_u_action_mapping import AdamUActionMappingConfig
 from configs.constants import (
     CAMERA_HEIGHT,
@@ -29,6 +30,40 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+def apply_execution_scope(
+    command: AdamUCommand,
+    *,
+    scope: str,
+    hold_body: np.ndarray,
+    hold_hands: np.ndarray,
+) -> AdamUCommand:
+    """Mask policy outputs while preserving the fixed Adam-U interface."""
+    if scope == "full":
+        return command
+    if scope != "right_arm_hand":
+        raise ValueError(f"Unsupported Adam-U execution scope: {scope!r}")
+    body = np.asarray(command.body, dtype=np.float32).copy()
+    hands = np.asarray(command.hands, dtype=np.float32).copy()
+    held_body = np.asarray(hold_body, dtype=np.float32)
+    held_hands = np.asarray(hold_hands, dtype=np.float32)
+    if held_body.shape != body.shape or held_hands.shape != hands.shape:
+        raise ValueError("Held Adam-U command shapes must match the policy command")
+    body[:, :12] = held_body[:, :12]  # waist, neck, left arm
+    hands[:, :6] = held_hands[:, :6]  # left hand
+    masked = AdamUCommand(
+        body=body,
+        hands=hands,
+        body_joint_names=command.body_joint_names,
+        hand_command_names=command.hand_command_names,
+        ignored_outputs=tuple(
+            dict.fromkeys((*command.ignored_outputs, "waist", "left_arm", "left_hand"))
+        ),
+        clamped_fields=command.clamped_fields,
+    )
+    masked.validate()
+    return masked
+
+
 class GrootAdapter:
     """Bridge between Adam-U Isaac Lab env and GR00T Policy API."""
 
@@ -41,12 +76,22 @@ class GrootAdapter:
         action_mapping_config: AdamUActionMappingConfig | None = None,
         ik_solver=None,
         legacy_g1_real: bool = False,
+        workspace_transform: G1AdamWorkspaceTransform | None = None,
+        virtual_g1_state: VirtualG1StateAdapter | None = None,
+        execution_scope: str = "right_arm_hand",
     ):
         self.env = env
         self.task_instruction = task_instruction
         self.execution_horizon = execution_horizon
         self.schema = schema if isinstance(schema, GrootSchema) else get_groot_schema(schema)
         self.legacy_g1_real = bool(legacy_g1_real)
+        self.workspace_transform = workspace_transform or G1AdamWorkspaceTransform()
+        self.virtual_g1_state = virtual_g1_state
+        if execution_scope not in ("right_arm_hand", "full"):
+            raise ValueError(f"Unsupported Adam-U execution scope: {execution_scope!r}")
+        self.execution_scope = execution_scope
+        self._hold_body: np.ndarray | None = None
+        self._hold_hands: np.ndarray | None = None
         self.joint_state = make_right_arm_reader(env)
         self._waist_state = JointStateReader(env, group="waist")
         self._neck_state = JointStateReader(env, group="neck")
@@ -148,6 +193,20 @@ class GrootAdapter:
         )
         left_wrist_eef = read_wrist_eef_9d(self.env, "left", num_envs)
         right_wrist_eef = read_wrist_eef_9d(self.env, "right", num_envs)
+        # REAL_G1 normalization and relative-action postprocessing operate in
+        # the G1 body-relative workspace, not Adam-U's Isaac world frame.
+        left_wrist_eef = self.workspace_transform.world_to_g1_pose(left_wrist_eef)
+        right_wrist_eef = self.workspace_transform.world_to_g1_pose(right_wrist_eef)
+        if self.virtual_g1_state is not None:
+            left_arm, right_arm = self.virtual_g1_state.update(left_wrist_eef, right_wrist_eef)
+            max_error = max(self.virtual_g1_state.last_errors.values())
+            if max_error > 0.05:
+                print(
+                    "[WARN] Virtual G1 wrist-state consistency error: "
+                    f"left={self.virtual_g1_state.last_errors['left']:.3f} m, "
+                    f"right={self.virtual_g1_state.last_errors['right']:.3f} m",
+                    flush=True,
+                )
 
         state: dict[str, np.ndarray] = {}
         for key, dim in self.schema.state_dims.items():
@@ -200,10 +259,26 @@ class GrootAdapter:
         """Return the public Adam-U body[19] and hands[12] low-level command."""
         if self.action_adapter is None:
             raise RuntimeError("The body[19]+hands[12] adapter is defined for the REAL_G1 compatibility schema")
-        return self.action_adapter.adapt(
+        current_body = self._current_body()
+        if self._hold_body is None:
+            self._hold_body = current_body.copy()
+            left = self._left_hand_state.get_positions().detach().cpu().numpy()
+            right = self._right_hand_state.get_positions().detach().cpu().numpy()
+            # Primary physical joint of each six-channel Adam-U hand synergy.
+            indices = (0, 3, 4, 6, 8, 10)
+            self._hold_hands = np.concatenate((left[:, indices], right[:, indices]), axis=1).astype(
+                np.float32
+            )
+        command = self.action_adapter.adapt(
             groot_action,
             step_index=step_index,
-            current_body=self._current_body(),
+            current_body=current_body,
+        )
+        return apply_execution_scope(
+            command,
+            scope=self.execution_scope,
+            hold_body=self._hold_body,
+            hold_hands=self._hold_hands,
         )
 
     def action_to_env(self, groot_action: dict[str, Any], step_index: int = 0) -> torch.Tensor:

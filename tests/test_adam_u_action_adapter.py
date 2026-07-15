@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "adam_u_groot"))
 
 from adapters.adam_u_action_adapter import RealG1ToAdamUAdapter
+from adapters.adam_u_action_adapter import AdamUCommand
+from adapters.groot_adapter import apply_execution_scope
 from configs.adam_u_action_mapping import AdamUActionMappingConfig
 
 
@@ -53,6 +55,23 @@ class FakeIK:
 
 
 class TestAdamUActionAdapter(unittest.TestCase):
+    def test_right_arm_hand_execution_scope_holds_everything_else(self):
+        command = AdamUCommand(
+            body=np.full((1, 19), 0.7, dtype=np.float32),
+            hands=np.full((1, 12), 0.8, dtype=np.float32),
+        )
+        hold_body = np.full((1, 19), -0.2, dtype=np.float32)
+        hold_hands = np.full((1, 12), 0.1, dtype=np.float32)
+        masked = apply_execution_scope(
+            command, scope="right_arm_hand", hold_body=hold_body, hold_hands=hold_hands
+        )
+        np.testing.assert_allclose(masked.body[:, :12], -0.2)
+        np.testing.assert_allclose(masked.body[:, 12:], 0.7)
+        np.testing.assert_allclose(masked.hands[:, :6], 0.1)
+        np.testing.assert_allclose(masked.hands[:, 6:], 0.8)
+        for key in ("waist", "left_arm", "left_hand"):
+            self.assertIn(key, masked.ignored_outputs)
+
     def test_joint_space_dimensions_neck_and_ignored_outputs(self):
         adapter = RealG1ToAdamUAdapter(config(neck_neutral=(0.15, -0.2)))
         command = adapter.adapt(synthetic_action(), current_body=np.zeros((1, 19)))
