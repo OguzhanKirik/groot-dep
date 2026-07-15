@@ -262,7 +262,10 @@ class RealG1ToAdamUAdapter:
                 ignored = ("left_arm", "right_arm", *self.IGNORED_FIXED_BASE)
 
             waist = self._calibrate_absolute(
-                waist_src, self.config.waist_sign, self.config.waist_zero_offset
+                # REAL_G1: yaw, roll, pitch -> Adam-U: roll, pitch, yaw.
+                waist_src[:, (1, 2, 0)],
+                self.config.waist_sign,
+                self.config.waist_zero_offset,
             )
             neck = np.broadcast_to(np.asarray(self.config.neck_neutral), (batch, 2)).copy()
             body = np.concatenate((waist, neck, left_arm, right_arm), axis=1)

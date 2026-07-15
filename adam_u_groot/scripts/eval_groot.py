@@ -129,7 +129,19 @@ parser.add_argument(
     help="Held Adam-U neck pose in radians; negative pitch looks down toward the table.",
 )
 parser.add_argument("--max-position-step", type=float, default=0.10)
+parser.add_argument(
+    "--eef-ik-joint-step",
+    type=float,
+    default=0.01,
+    help="Maximum EEF-IK change per Adam-U arm joint per simulation step (radians).",
+)
 parser.add_argument("--action-smoothing-alpha", type=float, default=1.0)
+parser.add_argument(
+    "--camera-debug-image",
+    type=str,
+    default="",
+    help="Optional path for saving the first rendered GR00T front-camera RGB frame.",
+)
 parser.add_argument(
     "--reach-hover-height", type=float, default=0.12,
     help="Scripted reach target height in meters above the cube center.",
@@ -290,6 +302,22 @@ def _frame_front_camera(env) -> None:
         f"[INFO] GR00T front camera eye={FRONT_CAMERA_POS}, lookat={FRONT_CAMERA_LOOKAT}",
         flush=True,
     )
+
+
+def _save_front_camera_debug_image(env, path: str) -> None:
+    """Save the exact first RGB tensor supplied to GR00T for visual diagnosis."""
+    if not path or "front_camera" not in env.scene.keys():
+        return
+    from pathlib import Path
+    from PIL import Image
+
+    rgb = env.scene["front_camera"].data.output["rgb"][0]
+    if rgb.dtype != torch.uint8:
+        rgb = (rgb.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+    output = Path(path).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgb.detach().cpu().numpy()).save(output)
+    print(f"[INFO] Saved GR00T front-camera debug frame: {output}", flush=True)
 
 
 def _make_zero_action(env) -> torch.Tensor:
@@ -495,6 +523,10 @@ def _launch_groot_server_after_isaac(embodiment_tag: str) -> tuple[subprocess.Po
 
 
 def main():
+    if args_cli.eef_ik_joint_step <= 0.0:
+        raise ValueError("--eef-ik-joint-step must be positive")
+    if args_cli.max_position_step <= 0.0:
+        raise ValueError("--max-position-step must be positive")
     if args_cli.control_mode == "g1_real" and (
         args_cli.mode != "groot" or args_cli.groot_schema != "real_g1"
     ):
@@ -578,7 +610,7 @@ def main():
     if args_cli.groot_schema == "real_g1" and args_cli.control_mode == "eef_space":
         ik_solver = IsaacDifferentialIKSolver(
             IsaacAdamUKinematicsProvider(env),
-            max_joint_delta=min(args_cli.max_position_step, 0.10),
+            max_joint_delta=min(args_cli.eef_ik_joint_step, args_cli.max_position_step),
             # G1 and Adam-U wrist/tool axes have not been calibrated yet.
             # Position control is safe after workspace conversion; pose control
             # would make IK chase an unknown tool-frame rotation offset.
@@ -661,6 +693,7 @@ def main():
 
     env.reset()
     _frame_front_camera(env)
+    _save_front_camera_debug_image(env, args_cli.camera_debug_image)
     scripted_hold_body = None
     scripted_hold_hands = None
     if args_cli.mode == "scripted_reach":

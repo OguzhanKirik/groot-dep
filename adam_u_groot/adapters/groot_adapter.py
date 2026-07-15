@@ -199,6 +199,11 @@ class GrootAdapter:
         right_wrist_eef = self.workspace_transform.world_to_g1_pose(right_wrist_eef)
         if self.virtual_g1_state is not None:
             left_arm, right_arm = self.virtual_g1_state.update(left_wrist_eef, right_wrist_eef)
+            # Use G1 FK for the complete EEF state so virtual G1 joints and
+            # wrist position/orientation describe one internally consistent
+            # configuration. Adam tool-frame orientation is not a G1 state.
+            left_wrist_eef = self.virtual_g1_state.last_eef_poses["left"]
+            right_wrist_eef = self.virtual_g1_state.last_eef_poses["right"]
             max_error = max(self.virtual_g1_state.last_errors.values())
             if max_error > 0.05:
                 print(
@@ -215,7 +220,8 @@ class GrootAdapter:
             elif key == "left_arm":
                 values = left_arm
             elif key == "waist":
-                values = waist
+                # Adam: roll, pitch, yaw. REAL_G1: yaw, roll, pitch.
+                values = waist[:, (2, 0, 1)]
             elif key == "right_hand":
                 values = right_hand[:, :dim] if right_hand.shape[1] >= dim else np.pad(
                     right_hand, ((0, 0), (0, dim - right_hand.shape[1]))
@@ -274,12 +280,19 @@ class GrootAdapter:
             step_index=step_index,
             current_body=current_body,
         )
-        return apply_execution_scope(
+        masked = apply_execution_scope(
             command,
             scope=self.execution_scope,
             hold_body=self._hold_body,
             hold_hands=self._hold_hands,
         )
+        ik_solver = self.action_adapter.ik_solver
+        if ik_solver is not None and hasattr(ik_solver, "sync_commanded_joint_pos"):
+            # Prevent integrator windup when URDF limits or the execution mask
+            # alter the raw IK result downstream.
+            ik_solver.sync_commanded_joint_pos("left", masked.body[:, 5:12])
+            ik_solver.sync_commanded_joint_pos("right", masked.body[:, 12:19])
+        return masked
 
     def action_to_env(self, groot_action: dict[str, Any], step_index: int = 0) -> torch.Tensor:
         """Convert body/hands commands into Isaac's body[19]+finger-joints[24] vector."""

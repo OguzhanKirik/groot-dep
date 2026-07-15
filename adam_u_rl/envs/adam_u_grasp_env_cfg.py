@@ -35,6 +35,7 @@ from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 import isaaclab.envs.mdp as mdp
 from envs.scene_layout import (
     OBJECT_POS,
+    OBJECT_SIZE,
     ROBOT_POS,
     ROBOT_ROT,
     TABLE_LEG_HEIGHT,
@@ -163,7 +164,7 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
             rot=[1, 0, 0, 0],
         ),
         spawn=sim_utils.CuboidCfg(
-            size=(0.05, 0.05, 0.05),  # 5cm 立方体
+            size=OBJECT_SIZE,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.25),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -256,10 +257,13 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
                     "shoulderYaw_Left",
                     "elbow_Left", 
                 ],
-                effort_limit_sim=10.0,
+                # Ten newton-metres was not enough to hold the extended
+                # pre-grasp pose against gravity, so measured joints sagged
+                # while IK kept integrating corrections.
+                effort_limit_sim=40.0,
                 velocity_limit_sim=2.0,
-                stiffness=80.0,
-                damping=10.0,
+                stiffness=120.0,
+                damping=25.0,
             ),
             # 其他关节执行器（保持固定或较小控制）
             "waist_actuators": ImplicitActuatorCfg(
@@ -278,10 +282,12 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
                     "wristPitch_Left", 
                     "wristRoll_Left"
                 ],
-                effort_limit_sim=10.0,
+                effort_limit_sim=15.0,
                 velocity_limit_sim=2.0,
                 stiffness=80.0,
-                damping=0.0,
+                # Zero damping made the three wrist axes ring around a fixed
+                # differential-IK target during teleoperation.
+                damping=15.0,
             ),
             "neck_actuators": ImplicitActuatorCfg(
                 joint_names_expr=["neck.*"],
@@ -292,10 +298,13 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
             ),
             "right_finger_actuators": ImplicitActuatorCfg(
                 joint_names_expr=["R_thumb.*", "R_index.*", "R_middle.*", "R_ring.*", "R_pinky.*"],
-                effort_limit_sim=10.0,
-                velocity_limit_sim=5.0,
-                stiffness=10.0,
-                damping=2.0,
+                # Stronger, slower grasp hold: higher proportional effort
+                # creates opposing normal force, while added damping prevents
+                # the fingers from rebounding off the object at closure.
+                effort_limit_sim=20.0,
+                velocity_limit_sim=2.0,
+                stiffness=25.0,
+                damping=4.0,
             ),
             "left_finger_actuators": ImplicitActuatorCfg(
                 joint_names_expr=["L_thumb.*", "L_index.*", "L_middle.*", "L_ring.*", "L_pinky.*"],
@@ -521,6 +530,22 @@ class TerminationsCfg:
 @configclass
 class EventsCfg:
     """事件配置"""
+
+    # Deterministic high-friction fingertip/contact material for grasping.
+    # Restrict this to hand links so arm/table contacts do not become sticky.
+    finger_physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["L_(thumb|index|middle|ring|pinky).*", "R_(thumb|index|middle|ring|pinky).*"]
+            ),
+            "static_friction_range": (1.2, 1.2),
+            "dynamic_friction_range": (1.0, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 1,
+        },
+    )
     
     # 启动时随机化物体质量
     randomize_object_mass = EventTerm(

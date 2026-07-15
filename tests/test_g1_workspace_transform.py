@@ -62,6 +62,11 @@ class TestVirtualG1StateAdapter(unittest.TestCase):
         self.assertLess(virtual.last_errors["right"], 0.01)
         self.assertTrue(np.all(np.isfinite(left_joints)))
         self.assertTrue(np.all(np.isfinite(right_joints)))
+        np.testing.assert_allclose(virtual.last_eef_poses["left"][0, :3], left[0, :3], atol=0.01)
+        np.testing.assert_allclose(virtual.last_eef_poses["right"][0, :3], right[0, :3], atol=0.01)
+        # Null-space posture bias keeps shoulder roll near the REAL_G1 dataset.
+        self.assertGreater(left_joints[0, 1], 0.16)
+        self.assertLess(right_joints[0, 1], -0.15)
 
 
 if __name__ == "__main__":

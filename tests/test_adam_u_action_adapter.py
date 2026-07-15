@@ -55,6 +55,14 @@ class FakeIK:
 
 
 class TestAdamUActionAdapter(unittest.TestCase):
+    def test_g1_waist_order_is_converted_to_adam_order(self):
+        action = synthetic_action()
+        action["waist"][0, 0] = [0.3, 0.1, -0.2]  # G1: yaw, roll, pitch
+        command = RealG1ToAdamUAdapter(config()).adapt(
+            action, current_body=np.zeros((1, 19), dtype=np.float32)
+        )
+        np.testing.assert_allclose(command.body[0, :3], [0.1, -0.2, 0.3], atol=1e-6)
+
     def test_right_arm_hand_execution_scope_holds_everything_else(self):
         command = AdamUCommand(
             body=np.full((1, 19), 0.7, dtype=np.float32),

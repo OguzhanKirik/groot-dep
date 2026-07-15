@@ -6,7 +6,7 @@ from __future__ import annotations
 # Adam-U faces -X. Keep the cube inside the fixed-waist arm workspace.
 TABLE_X = -0.50
 TABLE_Y = 0.0
-TABLE_TOP_POS = (TABLE_X, TABLE_Y, 0.85)
+TABLE_TOP_POS = (TABLE_X, TABLE_Y, 1.00)
 TABLE_TOP_SIZE = (0.6, 0.5, 0.05)
 TABLE_SURFACE_Z = TABLE_TOP_POS[2] + TABLE_TOP_SIZE[2] * 0.5  # 0.875 m
 
@@ -22,9 +22,10 @@ ROBOT_POS = (0.0, 0.0, ROBOT_BASE_Z)
 ROBOT_ROT = (0.0, 0.0, 1.0, 0.0)
 
 # Manipulation targets on the table surface.
-# Place the cube 10 cm closer to the robot than the table center. Adam-U faces
-# -X, so a less-negative X coordinate is closer to its torso.
-OBJECT_POS = (TABLE_X + 0.10, TABLE_Y, TABLE_SURFACE_Z + 0.025)  # (-0.40, 0.0, 0.90)
+# Keep the cube distinct from, but close to, the green placement target so the
+# fixed-cube teleop episode requires a short transfer within right-arm reach.
+OBJECT_SIZE = (0.05, 0.05, 0.05)
+OBJECT_POS = (TABLE_X + 0.14, TABLE_Y + 0.05, TABLE_SURFACE_Z + OBJECT_SIZE[2] * 0.5)
 PLACE_TARGET_POS = (TABLE_X + 0.25, TABLE_Y + 0.15, TABLE_SURFACE_Z + 0.005)
 
 # Default viewer framing (robot at origin, table in front).

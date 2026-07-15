@@ -20,6 +20,10 @@ match the transformed Adam-U wrist positions. Each solve is seeded from the
 previous virtual state to avoid elbow flips. Thus the G1 joint and EEF states
 fed to GR00T describe the same virtual configuration.
 
+Virtual G1 IK also supplies the wrist rot6d from G1 FK; it does not combine G1
+joints with Adam-U tool orientation. A null-space bias toward the checkpoint's
+mean arm posture avoids valid-but-out-of-distribution elbow/shoulder solutions.
+
 This integration treats the GR00T action dictionary as named groups. It never
 concatenates outputs based only on matching dimensions.
 
@@ -91,10 +95,19 @@ by name into thumb and MCP/DIP targets.
 Navigation and base height are always ignored because this integration controls
 a fixed upper body. Neck joints hold the configurable neutral pose.
 
+Waist ordering is explicitly permuted in both directions: REAL_G1 uses
+yaw/roll/pitch, while Adam-U uses roll/pitch/yaw. Persistent IK integrator state
+is synchronized to the final clamped and execution-masked target to prevent
+windup at joint limits.
+
 The default execution scope is `right_arm_hand`: GR00T still observes the full
 REAL_G1-compatible state, but only the right EEF/right arm and right hand are
 executed. Waist, neck, left arm, and left hand are latched after reset. Use
 `--execution-scope full` only for deliberate bimanual experiments.
+
+EEF differential IK has its own `--eef-ik-joint-step` limiter, defaulting to
+0.01 rad per arm joint per simulation step. It is deliberately separate from
+the broader body/hand adapter limit `--max-position-step`.
 
 ## Safety
 

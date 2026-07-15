@@ -25,6 +25,13 @@ G1_ARM_JOINT_NAMES = {
     for side in ("left", "right")
 }
 
+# REAL_G1 checkpoint state means provide a neutral null-space posture that is
+# both physically valid and inside the policy's training distribution.
+G1_ARM_REFERENCE = {
+    "left": np.asarray((-0.23496, 0.25878, -0.22397, 0.06399, -0.12444, 0.00951, 0.11621)),
+    "right": np.asarray((-0.24909, -0.28573, 0.13131, 0.08433, 0.01890, 0.03173, -0.09954)),
+}
+
 
 class VirtualG1StateAdapter:
     """Track continuous pseudo-G1 joints matching G1-canonical wrist positions.
@@ -42,6 +49,7 @@ class VirtualG1StateAdapter:
         max_iterations: int = 80,
         max_joint_update: float = 0.08,
         tolerance: float = 0.01,
+        posture_gain: float = 0.5,
     ) -> None:
         import pinocchio as pin
 
@@ -55,6 +63,7 @@ class VirtualG1StateAdapter:
         self.max_iterations = int(max_iterations)
         self.max_joint_update = float(max_joint_update)
         self.tolerance = float(tolerance)
+        self.posture_gain = float(posture_gain)
         self.q = pin.neutral(self.model)
         self._joint_q_ids: dict[str, list[int]] = {}
         self._joint_v_ids: dict[str, list[int]] = {}
@@ -91,6 +100,7 @@ class VirtualG1StateAdapter:
             joint = self.model.joints[self.model.getJointId(name)]
             self.q[joint.idx_q] = value
         self.last_errors = {"left": np.inf, "right": np.inf}
+        self.last_eef_poses: dict[str, np.ndarray] = {}
 
     @staticmethod
     def _positions(pose_9d: np.ndarray) -> np.ndarray:
@@ -119,9 +129,14 @@ class VirtualG1StateAdapter:
                 self.model, self.data, self.q, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
             )
             jacobian = full_jacobian[:3, v_ids]
-            delta = jacobian.T @ np.linalg.solve(
-                jacobian @ jacobian.T + self.damping**2 * identity, error
+            jacobian_pinv = jacobian.T @ np.linalg.solve(
+                jacobian @ jacobian.T + self.damping**2 * identity, identity
             )
+            task_delta = jacobian_pinv @ error
+            nullspace = np.eye(7) - jacobian_pinv @ jacobian
+            current_arm = self.q[self._joint_q_ids[side]]
+            posture_delta = self.posture_gain * (G1_ARM_REFERENCE[side] - current_arm)
+            delta = task_delta + nullspace @ posture_delta
             delta = np.clip(delta, -self.max_joint_update, self.max_joint_update)
             velocity = np.zeros(self.model.nv, dtype=np.float64)
             velocity[v_ids] = delta
@@ -138,7 +153,14 @@ class VirtualG1StateAdapter:
             raise ValueError("Virtual G1 state currently supports exactly one evaluation environment")
         self.last_errors["left"] = self._solve_side("left", left_positions[0])
         self.last_errors["right"] = self._solve_side("right", right_positions[0])
+        self.pin.forwardKinematics(self.model, self.data, self.q)
+        self.pin.updateFramePlacements(self.model, self.data)
+        for side in ("left", "right"):
+            placement = self.data.oMf[self._frame_ids[side]]
+            rot6d = placement.rotation[:2, :].reshape(6)
+            self.last_eef_poses[side] = np.concatenate((placement.translation, rot6d))[None, :].astype(
+                np.float32
+            )
         left = self.q[self._joint_q_ids["left"]][None, :].astype(np.float32)
         right = self.q[self._joint_q_ids["right"]][None, :].astype(np.float32)
         return left, right
-

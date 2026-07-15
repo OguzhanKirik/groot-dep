@@ -115,6 +115,94 @@ MAX_STEPS=500 REACH_JOINT_STEP=0.005 \
 `g1_real` intentionally reproduces the old double-offset behavior. It is unsafe
 for hardware and must be used only for simulation A/B testing.
 
+## Adam-U teleoperation and demonstration recording
+
+Collect native Adam-U demonstrations with:
+
+```bash
+conda activate adam-u-isaac-6
+cd ~/adam/adam_u_isaac_lab
+bash adam_u_groot/scripts/run_teleop_record_adam_u.sh \
+  --output logs/teleop/adam_u_demos.hdf5
+```
+
+Keyboard controls are `W/S`, `A/D`, `Q/E` for translation; `Z/X`, `T/G`,
+`C/V` for rotation; and `K` to toggle the right hand. `P` pauses recording,
+`R` discards and resets the current episode, and `Enter` stores it as a
+successful episode. Pass `--teleop-device spacemouse` for a SpaceMouse.
+
+The controller uses an Adam-U URDF/Pinocchio Jacobian with Isaac differential
+IK for a persistent six-dimensional right-wrist target, holds the other body
+targets stable, and enforces Cartesian workspace and joint-step limits.
+`Z/X`, `T/G`, and `C/V` update the target orientation about world X/Y/Z; the
+IK solver coordinates all seven right-arm joints to track the complete pose.
+The HDF5 recorder stores synchronized RGB, measured body[19]/hands[12],
+commanded body[19]/hands[12], right-wrist pose, object pose, and timestamp.
+Only episodes explicitly accepted with `Enter` are persisted.
+
+For an automatic six-waypoint diagnostic demonstration, run:
+
+```bash
+bash adam_u_groot/scripts/run_scripted_collect_adam_u.sh \
+  --output logs/teleop/adam_u_scripted_demos.hdf5
+```
+
+The state machine approaches 10 cm above the cube's top surface, rotates the
+palm downward about a fixed wrist, explicitly recenters the palm grasp center
+over the cube at that collision-free height,
+lowers to the configured clearance, closes the hand, and lifts 10 cm. It saves
+only if the measured cube height increases by at least 7 cm. Tune hand geometry
+with `--scripted-grasp-frame-offset X Y Z` and
+`--scripted-grasp-clearance`; their defaults are `-0.005 0 -0.15` m and 4 cm
+above the cube center. Since the cube is 5 cm tall, the latter places the
+pre-grasp center 1.5 cm above its top surface.
+The calibrated palm-down pose is the default; pass
+`--scripted-use-relative-grasp-rotation --scripted-grasp-rotvec RX RY RZ` to
+use a relative orientation instead.
+
+The recenter and descent phases track the cube's live X/Y position. IK joint
+targets are rate-limited and EMA-filtered; tune them with
+`--max-joint-target-step` (default `0.01` rad/step) and
+`--joint-target-smoothing` (default `0.35`, lower is smoother).
+During recentering, measured `R_thumb_distal` and `R_middle_distal` links target
+the centers of opposite sides of the 5 cm cube. Their averaged XY error centers
+the pinch corridor on the cube without favoring either contact. The correction
+is limited to 3 cm per target update; tune these assumptions with
+`--scripted-cube-size` and `--scripted-max-contact-center-correction` (the old
+`--scripted-max-thumb-center-correction` name remains accepted).
+The recenter and descent waypoints cannot advance until this measured pinch
+midpoint is within 8 mm of the cube center; configure that threshold with
+`--scripted-contact-center-tolerance` and inspect `pinch_center_error` in the
+periodic logs.
+Palm parallelism is checked independently: local palm normal `+Y` must align
+with world/table down `-Z`. Recenter and descent require less than `0.10` rad
+(about 5.7 degrees) of tilt by default; configure
+`--scripted-palm-tilt-tolerance` and inspect `palm_tilt_error` in the logs.
+
+At the end of descent, the measured wrist pose is latched so IK no longer
+pushes into the cube while the hand closes. Closure takes 30 simulation steps,
+followed by a 20-step fixed-pose settling period before lift. Tune these with
+`--scripted-close-steps` and `--scripted-post-close-hold-steps`.
+
+### Pink IK teleoperation backend
+
+Manual teleoperation can use Pink 3 / Pinocchio QP IK instead of Isaac's DLS
+controller:
+
+```bash
+python adam_u_groot/scripts/teleop_record_adam_u.py \
+  --gui --fixed-cube --ik-backend pink
+```
+
+Pink runs on a reduced seven-joint arm model, so it cannot satisfy the wrist
+task using waist or finger motion that the teleop interface would discard. Its
+QP uses Adam-U's calibrated world-frame Jacobian plus a low-cost posture task;
+the raw URDF wrist frame does not exactly match the imported Isaac articulation.
+Pink also accumulates a bounded actuator target to resist gravity sag and
+retains the shared joint-step, rate-limit, smoothing, and joint-limit layers.
+Tune `--pink-position-cost`, `--pink-orientation-cost`,
+`--pink-posture-cost`, `--pink-damping`, and `--pink-qp-solver daqp|osqp`.
+
 ## Main files
 
 - `groot_adapter.py`: observation packing and simulator command assembly.
