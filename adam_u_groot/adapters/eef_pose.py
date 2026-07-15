@@ -549,7 +549,22 @@ class MinkAdamUIKSolver:
         self.provider = provider
         self.mink = mink
         self.mujoco = mujoco
-        self.model = mujoco.MjModel.from_xml_path(str(path))
+        # PND's published MJCF is floating-base because their general teleop
+        # stack can retarget the whole robot. Adam-U is fixed in our Isaac
+        # scene. Leaving that free joint in the QP gives Mink six unbounded
+        # base DOFs and lets it satisfy wrist targets by levitating the model.
+        # Remove the DOFs entirely rather than approximating a weld with a
+        # large task weight.
+        spec = mujoco.MjSpec.from_file(str(path))
+        floating_base = spec.joint("floating_base")
+        if floating_base is None or floating_base.type != mujoco.mjtJoint.mjJNT_FREE:
+            raise ValueError(
+                "Official Adam-U MJCF must contain the expected floating_base free joint"
+            )
+        spec.delete(floating_base)
+        self.model = spec.compile()
+        if np.any(self.model.jnt_type == mujoco.mjtJoint.mjJNT_FREE):
+            raise ValueError("Mink Adam-U model still contains an unconstrained free joint")
         self.max_joint_delta = float(max_joint_delta)
         self.max_commanded_joint_error = (
             None if max_commanded_joint_error is None else float(max_commanded_joint_error)
@@ -562,6 +577,7 @@ class MinkAdamUIKSolver:
         self._states: dict[tuple[str, int], dict[str, object]] = {}
         self._translation_priority = False
         self._translation_orientation_cost = self.PND_SOFT_ORIENTATION_COST
+        self._reference_qpos = self.mink.Configuration(self.model).data.qpos.copy()
 
         from configs.joint_state import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
 
@@ -657,7 +673,7 @@ class MinkAdamUIKSolver:
         return limits
 
     def _new_state(self, side: str, env_index: int, current: np.ndarray, measured_pose: np.ndarray):
-        configuration = self.mink.Configuration(self.model)
+        configuration = self.mink.Configuration(self.model, self._reference_qpos.copy())
         for arm_name, value in zip(self._arm_names[side], current, strict=True):
             configuration.data.qpos[self._qpos_indices[arm_name]] = float(value)
         self.mujoco.mj_forward(self.model, configuration.data)
@@ -809,6 +825,10 @@ class MinkAdamUIKSolver:
             state = self._states.get((side, env_index))
             if state is None:
                 continue
+            # Defensive reset: inactive joints must never retain QP drift from
+            # a prior solve. The welded base has no qpos entries, while waist,
+            # neck, opposite arm and hands return to their reference values.
+            state["configuration"].data.qpos[:] = self._reference_qpos
             for name, value in zip(self._arm_names[side], arm, strict=True):
                 state["configuration"].data.qpos[self._qpos_indices[name]] = float(value)
             self.mujoco.mj_forward(self.model, state["configuration"].data)

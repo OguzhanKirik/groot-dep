@@ -64,7 +64,7 @@ parser.add_argument(
     help="While jogging XYZ, rebase non-commanded axes to the measured wrist position.",
 )
 parser.add_argument("--rotation-sensitivity", type=float, default=0.01, help="Radians per simulation step while a rotation key is held.")
-parser.add_argument("--ik-joint-step", type=float, default=0.03)
+parser.add_argument("--ik-joint-step", type=float, default=0.01)
 parser.add_argument("--ik-backend", choices=("isaac", "mink", "pink"), default="isaac")
 parser.add_argument(
     "--mink-model",
@@ -74,12 +74,12 @@ parser.add_argument(
     ),
     help="PND's official Adam-U MJCF used only for host-side Mink kinematics.",
 )
-parser.add_argument("--mink-damping", type=float, default=0.01)
+parser.add_argument("--mink-damping", type=float, default=0.3)
 parser.add_argument("--mink-iterations", type=int, default=3)
 parser.add_argument(
     "--mink-translation-orientation-cost",
     type=float,
-    default=0.0,
+    default=2.0,
     help="Soft wrist-orientation cost while an XYZ key is held; PND's 18 is restored afterward.",
 )
 parser.add_argument(
@@ -106,8 +106,8 @@ parser.add_argument("--pink-damping", type=float, default=1e-6)
 parser.add_argument("--pink-qp-solver", choices=("daqp", "osqp"), default="daqp")
 parser.add_argument("--max-eef-error", type=float, default=0.08, help="Maximum target-to-measured wrist distance in metres.")
 parser.add_argument("--max-joint-lead", type=float, default=0.10, help="Maximum persistent IK target lead over a measured joint in radians.")
-parser.add_argument("--joint-target-smoothing", type=float, default=1.0, help="EMA weight for each new IK joint target (0, 1].")
-parser.add_argument("--max-joint-target-step", type=float, default=0.03, help="Maximum commanded joint-target change per simulation step in radians.")
+parser.add_argument("--joint-target-smoothing", type=float, default=0.35, help="EMA weight for each new IK joint target (0, 1].")
+parser.add_argument("--max-joint-target-step", type=float, default=0.01, help="Maximum commanded joint-target change per simulation step in radians.")
 parser.add_argument("--workspace-min", type=float, nargs=3, default=(-0.85, -0.50, 0.72))
 parser.add_argument("--workspace-max", type=float, nargs=3, default=(-0.08, 0.50, 1.55))
 parser.add_argument(
@@ -665,6 +665,10 @@ def main() -> None:
         current_body = _ordered_joint_positions(robot, BODY_JOINT_NAMES)
         measured_pose_before, _ = provider("right", current_body[:, 12:19])
         measured_rotation_before = _matrix_from_pose9(measured_pose_before[0])
+        measured_palm_before = (
+            measured_pose_before[0, :3]
+            + measured_rotation_before @ grasp_frame_offset
+        )
         translation_is_active = False
         stabilizing = step < args_cli.startup_stabilization_steps
         if stabilizing:
@@ -675,7 +679,7 @@ def main() -> None:
             command[:6] = 0.0
             key, axis = translation_test_cases[translation_test_index]
             if translation_test_step == 0:
-                translation_test_start = measured_pose_before[0, :3].copy()
+                translation_test_start = measured_palm_before.copy()
                 translation_test_joint_start = current_body[0, 12:19].copy()
                 translation_was_active = False
                 manual_pose_was_active = False
@@ -879,10 +883,20 @@ def main() -> None:
                 translation_is_active,
                 orientation_cost=args_cli.mink_translation_orientation_cost,
             )
-        raw_right_target = solver.solve(
-            "right", _pose9(target_position, target_rotation)[None], current_body[:, 12:19],
-            command_is_relative=False,
-        ).astype(np.float32)
+        if stabilizing:
+            # A stabilization phase must be a genuine joint-space hold.  Merely
+            # zeroing keyboard input still left the precomputed over-cube pose
+            # active, causing IK to move the arm while the UI claimed that the
+            # robot was stabilizing.  Hold the reset pose under PD + gravity
+            # compensation, then allow Mink to pursue the Cartesian target.
+            raw_right_target = hold_body[:, 12:19].copy()
+        else:
+            raw_right_target = solver.solve(
+                "right",
+                _pose9(target_position, target_rotation)[None],
+                current_body[:, 12:19],
+                command_is_relative=False,
+            ).astype(np.float32)
         raw_right_target = np.clip(
             raw_right_target,
             current_body[:, 12:19] - args_cli.max_joint_lead,
@@ -936,7 +950,12 @@ def main() -> None:
         if args_cli.translation_self_test and not stabilizing:
             key, axis = translation_test_cases[translation_test_index]
             if translation_test_step == 29:
-                displacement = measured_wrist[0, :3] - translation_test_start
+                measured_rotation_after = _matrix_from_pose9(measured_wrist[0])
+                measured_palm_after = (
+                    measured_wrist[0, :3]
+                    + measured_rotation_after @ grasp_frame_offset
+                )
+                displacement = measured_palm_after - translation_test_start
                 measured_joint_delta = measured_body[12:19] - translation_test_joint_start
                 commanded_joint_delta = body_action[0, 12:19] - translation_test_joint_start
                 along = float(np.dot(displacement, axis))

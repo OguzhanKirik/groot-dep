@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import mujoco
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "adam_u_groot"))
@@ -37,6 +38,10 @@ class MinkAdamUIKSolverTest(unittest.TestCase):
         if not model.is_file():
             self.skipTest("optional pnd_models checkout is not installed")
         solver = MinkAdamUIKSolver(_SyntheticIsaacProvider(), model)
+        self.assertFalse(
+            np.any(solver.model.jnt_type == mujoco.mjtJoint.mjJNT_FREE),
+            "fixed-upper-body Mink backend must not expose floating-base DOFs",
+        )
         current = np.zeros((1, 7), dtype=np.float32)
         command = np.tile(IDENTITY_EEF_9D, (1, 1))
         hold = solver.solve("right", command, current, command_is_relative=False)

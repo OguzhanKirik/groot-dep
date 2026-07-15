@@ -46,6 +46,11 @@ Isaac Lab remains the simulator. Mink runs host-side against PND's official
 Adam-U MuJoCo kinematic model and sends only joint-position targets to the
 Isaac articulation.
 
+PND's MJCF contains a `floating_base` free joint. The backend deletes that
+joint through MuJoCo `MjSpec` before compiling its IK model, matching the
+fixed-base Adam-U articulation in Isaac. This is a structural weld: the QP
+cannot satisfy wrist targets by translating or rotating an internal base.
+
 Install the pinned backend without changing Isaac Sim's MuJoCo 3.8.0:
 
 ```bash
