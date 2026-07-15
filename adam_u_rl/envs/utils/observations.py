@@ -6,13 +6,8 @@
 from __future__ import annotations
 
 import torch
-from typing import TYPE_CHECKING
 
-# if TYPE_CHECKING:
 from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.envs.mdp import actions_cfg
-import isaaclab.envs.mdp as mdp
-from isaaclab.envs.mdp.actions import JointAction
 
 def object_obs(
     env: ManagerBasedRLEnv,

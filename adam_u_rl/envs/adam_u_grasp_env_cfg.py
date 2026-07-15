@@ -7,19 +7,16 @@
 
 import os
 import sys
-# 添加项目根目录到 Python 路径
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-import math
-from typing import Sequence
+# 添加项目根目录到 Python 路径
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
 import torch
-from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.envs import ManagerBasedRLEnvCfg, ManagerBasedEnv
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -29,21 +26,25 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
 from isaaclab.sensors import FrameTransformer
 from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
-from isaaclab.utils.math import quat_apply
-from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
-from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
-from isaaclab.envs.mdp.actions.pink_actions_cfg import PinkInverseKinematicsActionCfg
-from isaaclab.controllers.pink_ik_cfg import PinkIKControllerCfg
-from pink.tasks import FrameTask
 
 # 导入MDP函数
 import isaaclab.envs.mdp as mdp
+from envs.scene_layout import (
+    OBJECT_POS,
+    ROBOT_POS,
+    ROBOT_ROT,
+    TABLE_LEG_HEIGHT,
+    TABLE_LEG_POS,
+    TABLE_SURFACE_Z,
+    TABLE_TOP_POS,
+    TABLE_TOP_SIZE,
+    VIEWER_EYE,
+    VIEWER_LOOKAT,
+)
 from envs.utils.observations import *
 
 ##
@@ -78,7 +79,7 @@ def compute_height_reward(env, asset_cfg: SceneEntityCfg):
     object_pos = env.scene["object"].data.root_pos_w
     
     # 桌面高度
-    table_height = 1.05
+    table_height = TABLE_SURFACE_Z
     
     # 物体高度超过桌面给予奖励
     height_above_table = object_pos[:, 2] - table_height
@@ -111,11 +112,11 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
     table_top = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/TableTop",
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=[0.0, 0.0, 1.0], 
-            rot=[1.0, 0.0, 0.0, 0.0]
+            pos=list(TABLE_TOP_POS),
+            rot=[1.0, 0.0, 0.0, 0.0],
         ),
         spawn=sim_utils.CuboidCfg(
-            size=(0.6, 0.5, 0.05),
+            size=TABLE_TOP_SIZE,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             mass_props=sim_utils.MassPropertiesCfg(mass=50.0),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -137,12 +138,12 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
     table_leg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/TableLeg",
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=[0.0, 0.0, 0.5], 
-            rot=[1.0, 0.0, 0.0, 0.0]
+            pos=list(TABLE_LEG_POS),
+            rot=[1.0, 0.0, 0.0, 0.0],
         ),
         spawn=sim_utils.CylinderCfg(
             radius=0.03,
-            height=1.0,
+            height=TABLE_LEG_HEIGHT,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             mass_props=sim_utils.MassPropertiesCfg(mass=20.0),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -158,8 +159,8 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
     object = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object",
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=[0.0, 0.0, 1.05],  # 放在桌子上，z=0.8
-            rot=[1, 0, 0, 0]
+            pos=list(OBJECT_POS),
+            rot=[1, 0, 0, 0],
         ),
         spawn=sim_utils.CuboidCfg(
             size=(0.05, 0.05, 0.05),  # 5cm 立方体
@@ -201,8 +202,8 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, -0.4, 1.0),
-            rot=(0.707, 0.0, 0.0, 0.707),
+            pos=ROBOT_POS,
+            rot=ROBOT_ROT,
             joint_pos={
                 # 腰部关节
                 "waistRoll": 0.0,
@@ -253,16 +254,16 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
                     "shoulderYaw_Left",
                     "elbow_Left", 
                 ],
-                effort_limit=10.0,
-                velocity_limit=2.0,
+                effort_limit_sim=10.0,
+                velocity_limit_sim=2.0,
                 stiffness=80.0,
                 damping=10.0,
             ),
             # 其他关节执行器（保持固定或较小控制）
             "waist_actuators": ImplicitActuatorCfg(
                 joint_names_expr=["waist.*"],
-                effort_limit=110.0,
-                velocity_limit=8.0,
+                effort_limit_sim=110.0,
+                velocity_limit_sim=8.0,
                 stiffness=80.0,
                 damping=20.0,
             ),
@@ -275,29 +276,29 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
                     "wristPitch_Left", 
                     "wristRoll_Left"
                 ],
-                effort_limit=10.0,
-                velocity_limit=2.0,
+                effort_limit_sim=10.0,
+                velocity_limit_sim=2.0,
                 stiffness=80.0,
                 damping=0.0,
             ),
             "neck_actuators": ImplicitActuatorCfg(
                 joint_names_expr=["neck.*"],
-                effort_limit=6.4,
-                velocity_limit=5.0,
+                effort_limit_sim=6.4,
+                velocity_limit_sim=5.0,
                 stiffness=20.0,
                 damping=5.0,
             ),
             "right_finger_actuators": ImplicitActuatorCfg(
                 joint_names_expr=["R_thumb.*", "R_index.*", "R_middle.*", "R_ring.*", "R_pinky.*"],
-                effort_limit=10.0,
-                velocity_limit=5.0,
+                effort_limit_sim=10.0,
+                velocity_limit_sim=5.0,
                 stiffness=10.0,
                 damping=2.0,
             ),
             "left_finger_actuators": ImplicitActuatorCfg(
                 joint_names_expr=["L_thumb.*", "L_index.*", "L_middle.*", "L_ring.*", "L_pinky.*"],
-                effort_limit=10.0,
-                velocity_limit=10.0,
+                effort_limit_sim=10.0,
+                velocity_limit_sim=10.0,
                 stiffness=5.0,
                 damping=2.0,
             ),
@@ -586,8 +587,8 @@ class AdamUGraspEnvCfg(ManagerBasedRLEnvCfg):
         self.episode_length_s = 10.0  # 回合长度
         
         # 视角设置
-        self.viewer.eye = (2.0, 2.0, 2.0)
-        self.viewer.lookat = (0.0, 0.0, 1.0)
+        self.viewer.eye = VIEWER_EYE
+        self.viewer.lookat = VIEWER_LOOKAT
         
         # 仿真设置
         self.sim.dt = 1 / 60  # 仿真时间步长

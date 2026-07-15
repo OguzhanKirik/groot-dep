@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+# Isaac Lab generated converter artifacts and temporary merged URDF files.
+assets/robots/adam_u/generated_usd/
+assets/robots/adam_u/urdf/.merged_*.urdf
+
+# Local runtime output.
+logs/
+videos/
