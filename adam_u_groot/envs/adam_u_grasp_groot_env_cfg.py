@@ -240,9 +240,8 @@ def make_groot_env_cfg(
     if include_cameras:
         cfg.scene = AdamUGraspGrootSceneCfg(num_envs=num_envs, env_spacing=env_spacing)
         if not include_wrist_camera:
-            # REAL_G1 consumes only ``ego_view`` (the front camera).  Creating an
-            # unused second RTX render product can deadlock PhysX startup in the
-            # unified torch/GR00T environment.
+            # REAL_G1 consumes only ``ego_view`` (the front camera), so avoid the
+            # cost of creating an unused second RTX render product.
             cfg.scene.wrist_camera = None
         # Safer startup when attaching Replicator render products alongside PhysX views.
         cfg.scene.replicate_physics = False

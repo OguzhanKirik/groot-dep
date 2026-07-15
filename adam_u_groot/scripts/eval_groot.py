@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import importlib.util
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -125,15 +127,13 @@ if "--gui" in sys.argv:
 
 args_cli = parser.parse_args()
 
-need_scene_cameras = (args_cli.mode == "groot" and args_cli.groot_schema == "adam_u") or args_cli.video
+need_scene_cameras = args_cli.mode == "groot" or args_cli.video
 if need_scene_cameras:
     args_cli.enable_cameras = True
 elif args_cli.enable_cameras:
     print(
         "[INFO] --enable_cameras ignored for this mode/schema. "
-        "The REAL_G1 compatibility shim uses a fallback ego frame because RTX scene "
-        "cameras currently deadlock PhysX startup. Native cameras remain enabled for "
-        "the adam_u schema.",
+        "Scene cameras are enabled only for GR00T evaluation or video recording.",
         flush=True,
     )
     args_cli.enable_cameras = False
@@ -309,6 +309,35 @@ def _load_groot_policy_inprocess(model_path: str, embodiment_tag: str, device: s
     )
 
 
+def _stop_groot_server(process: subprocess.Popen, log_file=None) -> None:
+    """Terminate the complete conda/server process group, including orphaned children."""
+    process_group_id = getattr(process, "_groot_process_group_id", process.pid)
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+    if log_file is not None and not log_file.closed:
+        log_file.close()
+
+
 def _launch_groot_server_after_isaac(embodiment_tag: str) -> tuple[subprocess.Popen, object]:
     """Start GR00T only after PhysX owns its CUDA context."""
     log_file = open(args_cli.groot_server_log, "w", buffering=1)
@@ -321,7 +350,16 @@ def _launch_groot_server_after_isaac(embodiment_tag: str) -> tuple[subprocess.Po
         "--port", str(args_cli.groot_port),
     ]
     print("[INFO] Isaac is ready; starting the GR00T server now...", flush=True)
-    process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT)
+    process = subprocess.Popen(
+        command,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    process._groot_process_group_id = process.pid
+    shutdown_callback = lambda: _stop_groot_server(process, log_file)
+    process._groot_shutdown_callback = shutdown_callback
+    atexit.register(shutdown_callback)
     for _ in range(300):
         if process.poll() is not None:
             log_file.flush()
@@ -334,7 +372,7 @@ def _launch_groot_server_after_isaac(embodiment_tag: str) -> tuple[subprocess.Po
                 return process, log_file
         except OSError:
             time.sleep(1)
-    process.terminate()
+    _stop_groot_server(process, log_file)
     raise TimeoutError(f"Timed out waiting for GR00T server; see {args_cli.groot_server_log}")
 
 
@@ -493,13 +531,8 @@ def main():
 
     env.close()
     if groot_server_process is not None:
-        groot_server_process.terminate()
-        try:
-            groot_server_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            groot_server_process.kill()
-        if groot_server_log is not None:
-            groot_server_log.close()
+        _stop_groot_server(groot_server_process, groot_server_log)
+        atexit.unregister(groot_server_process._groot_shutdown_callback)
     simulation_app.close()
     print(f"[INFO] Finished eval after {step} steps.")
 

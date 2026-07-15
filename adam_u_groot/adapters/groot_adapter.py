@@ -41,6 +41,7 @@ class GrootAdapter:
         self._waist_state = JointStateReader(env, group="waist")
         self._left_arm_state = JointStateReader(env, group="left_arm")
         self._right_hand_state = JointStateReader(env, group="right_hand")
+        self._logged_video_stats = False
 
     def get_right_arm_state(self) -> torch.Tensor:
         """Return right-arm joint positions, shape (num_envs, 7)."""
@@ -71,10 +72,16 @@ class GrootAdapter:
         # REAL_G1: single ego_view, two-frame horizon (duplicate current front frame).
         if FRONT_CAMERA_NAME in self.env.scene.keys():
             front = self.get_camera_rgb(FRONT_CAMERA_NAME).detach().cpu().numpy()
+            if not self._logged_video_stats:
+                print(
+                    f"[INFO] GR00T ego_view: real RGB camera, shape={front.shape}, "
+                    f"min={front.min()}, max={front.max()}, mean={front.mean():.1f}",
+                    flush=True,
+                )
+                self._logged_video_stats = True
         else:
-            # REAL_G1 is a base-checkpoint compatibility shim, not the native
-            # Adam-U visual policy. Keep its required tensor contract without
-            # creating the RTX sensor that currently deadlocks PhysX startup.
+            # Preserve the required tensor contract for camera-free diagnostic
+            # runs; normal GR00T evaluation creates the real front RGB sensor.
             front = np.zeros(
                 (num_envs, CAMERA_HEIGHT, CAMERA_WIDTH, 3),
                 dtype=np.uint8,
