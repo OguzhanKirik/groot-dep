@@ -213,7 +213,9 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
                 
                 # Right-arm pre-grasp pose: forward, elbow bent, and wrist
                 # pitched toward the lowered tabletop.
-                "shoulderPitch_Right": -0.20,
+                # FK-verified: -0.35 raises wristRollRight about 4.6 cm over
+                # the previous -0.20 pose, keeping the open hand off the table.
+                "shoulderPitch_Right": -0.35,
                 "shoulderRoll_Right": 0.20,
                 "shoulderYaw_Right": 0.0,
                 "elbow_Right": -1.10,
@@ -262,8 +264,17 @@ class AdamUGraspSceneCfg(InteractiveSceneCfg):
                 # while IK kept integrating corrections.
                 effort_limit_sim=40.0,
                 velocity_limit_sim=2.0,
-                stiffness=120.0,
-                damping=25.0,
+                # Cartesian translation is carried mainly by these loaded
+                # shoulder/elbow joints. At stiffness 120 and the teleop's
+                # 0.10 rad target-lead bound, only ~12 N m was requested and
+                # XYZ commands stalled under gravity despite a 40 N m limit.
+                # PND's host-side IK assumes a stiff, gravity-compensated
+                # low-level position servo. Isaac has no gravity feed-forward
+                # here, so a higher implicit-drive gain is needed to keep
+                # vertical Cartesian commands from being hidden by arm sag.
+                # Effort remains capped at 40 N m.
+                stiffness=800.0,
+                damping=60.0,
             ),
             # 其他关节执行器（保持固定或较小控制）
             "waist_actuators": ImplicitActuatorCfg(

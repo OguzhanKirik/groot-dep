@@ -8,3 +8,6 @@ assets/robots/adam_u/urdf/.merged_*.urdf
 # Local runtime output.
 logs/
 videos/
+
+# Optional read-only upstream model checkout used by the host-side Mink IK.
+third_party/pnd_models/

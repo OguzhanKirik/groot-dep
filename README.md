@@ -40,6 +40,50 @@ cd adam_u_rl
 
 ## Quick Start
 
+### Adam-U Cartesian teleoperation with PND Mink IK
+
+Isaac Lab remains the simulator. Mink runs host-side against PND's official
+Adam-U MuJoCo kinematic model and sends only joint-position targets to the
+Isaac articulation.
+
+Install the pinned backend without changing Isaac Sim's MuJoCo 3.8.0:
+
+```bash
+conda activate adam-u-isaac-6
+cd ~/adam/adam_u_isaac_lab
+bash adam_u_groot/scripts/setup_mink_backend.sh
+```
+
+Run keyboard teleoperation:
+
+```bash
+python adam_u_groot/scripts/teleop_record_adam_u.py \
+  --gui \
+  --ik-backend mink \
+  --fixed-cube \
+  --startup-over-cube-palm-down \
+  --output logs/teleop/adam_u_mink_demos.hdf5
+```
+
+The teleop defaults use a 1 mm Cartesian target increment and a bounded
+10 mrad Mink joint increment per simulation step. This keeps keyboard targets
+from outrunning the articulation and remaining stuck at the 8 cm EEF-error
+safety boundary. Override them with `--position-sensitivity` and
+`--ik-joint-step` only as a matched pair.
+
+Keyboard translation uses world axes (W/S: X, A/D: Y, Q/E: Z). Wrist rotation
+uses the current hand/tool axes (Z/X: local roll, T/G: local pitch, C/V: local
+yaw). Tool-local composition prevents a palm-down roll command from being
+misinterpreted as a world-X rotation and unnecessarily moving the shoulder.
+
+The direct teleop target is already a `wristRollRight` pose, so PND's tracker
+frame rotation is off by default. For an external VR/controller pose, add
+`--mink-controller-frame-offset`; this applies PND's WXYZ quaternion
+`[0.866, 0, -0.5, 0]`. The backend uses PND's wrist task costs 20/18,
+LM damping 1.0, QP damping 0.3, DAQP, three iterations, 2 cm collision margin,
+3 cm collision detection distance, joint limits and velocity limits. Isaac-side
+slew, smoothing and maximum joint-lead checks remain active afterward.
+
 ### Train
 
 Navigate to the `manipulation` folder and run:
@@ -236,4 +280,3 @@ object_height = RewTerm(func=compute_height_reward, weight=10.0)
 ```
 
 ---
-

@@ -490,6 +490,330 @@ class PinkAdamUIKSolver:
         self._commanded_joint_pos[side] = values.astype(np.float32).copy()
 
 
+class MinkAdamUIKSolver:
+    """PND-tuned MuJoCo/Mink QP IK while Isaac Lab remains the simulator.
+
+    The solver owns a persistent Mink configuration, just like PND's
+    ``AdamMinkBase``.  Isaac supplies measured wrist poses and joint feedback;
+    only the resulting Adam-U arm joint targets are returned to Isaac.
+
+    Direct teleoperation commands already describe ``wristRoll*`` poses, so
+    the mocap/controller-frame wrist offset is disabled by default.  Set
+    ``apply_controller_frame_offset`` only when the input pose is in PND's
+    controller/tracker frame.
+    """
+
+    PND_SOLVER = "daqp"
+    PND_DAMPING = 3e-1
+    PND_ITERATIONS = 3
+    PND_ERROR_THRESHOLD = 1e-3
+    PND_WRIST_POSITION_COST = 20.0
+    PND_WRIST_ORIENTATION_COST = 18.0
+    PND_SOFT_ORIENTATION_COST = 2.0
+    PND_LM_DAMPING = 1.0
+    PND_WRIST_OFFSET_WXYZ = np.asarray((0.866, 0.0, -0.5, 0.0), dtype=np.float64)
+
+    def __init__(
+        self,
+        provider: "IsaacAdamUKinematicsProvider",
+        model_path,
+        *,
+        max_joint_delta: float = 0.005,
+        max_commanded_joint_error: float | None = 0.10,
+        solver: str = PND_SOLVER,
+        damping: float = PND_DAMPING,
+        iterations: int = PND_ITERATIONS,
+        apply_controller_frame_offset: bool = False,
+        collision_avoidance: bool = True,
+    ) -> None:
+        from pathlib import Path
+
+        import mink
+        import mujoco
+        import qpsolvers
+
+        path = Path(model_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Official Adam-U MJCF not found: {path}. Clone pndbotics/pnd_models "
+                "and pass --mink-model /path/to/pnd_models/adam_u/adam_u.xml"
+            )
+        if solver not in qpsolvers.available_solvers:
+            raise ValueError(
+                f"Mink QP solver {solver!r} is unavailable; installed: "
+                f"{qpsolvers.available_solvers}"
+            )
+        if max_joint_delta <= 0 or damping < 0 or iterations < 1:
+            raise ValueError("Mink step, damping, or iteration count is invalid")
+
+        self.provider = provider
+        self.mink = mink
+        self.mujoco = mujoco
+        self.model = mujoco.MjModel.from_xml_path(str(path))
+        self.max_joint_delta = float(max_joint_delta)
+        self.max_commanded_joint_error = (
+            None if max_commanded_joint_error is None else float(max_commanded_joint_error)
+        )
+        self.qp_solver = solver
+        self.damping = float(damping)
+        self.iterations = int(iterations)
+        self.apply_controller_frame_offset = bool(apply_controller_frame_offset)
+        self.collision_avoidance = bool(collision_avoidance)
+        self._states: dict[tuple[str, int], dict[str, object]] = {}
+        self._translation_priority = False
+        self._translation_orientation_cost = self.PND_SOFT_ORIENTATION_COST
+
+        from configs.joint_state import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
+
+        self._arm_names = {
+            "left": LEFT_ARM_JOINT_NAMES,
+            "right": RIGHT_ARM_JOINT_NAMES,
+        }
+        self._qpos_indices: dict[str, int] = {}
+        for names in self._arm_names.values():
+            for name in names:
+                joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                if joint_id < 0:
+                    raise ValueError(f"Official Adam-U MJCF is missing joint {name!r}")
+                self._qpos_indices[name] = int(self.model.jnt_qposadr[joint_id])
+        for body in ("wristRollLeft", "wristRollRight"):
+            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body) < 0:
+                raise ValueError(f"Official Adam-U MJCF is missing body {body!r}")
+
+    def _geom_group(self, names):
+        """Resolve PND config labels as geom names or all geoms on a body.
+
+        PND's current MJCF leaves collision geoms unnamed while its YAML uses
+        link/body labels.  Mink itself accepts geom IDs, so expand body labels
+        explicitly instead of depending on an older named-geom export.
+        """
+        geom_ids = []
+        for name in names:
+            geom_id = self.mujoco.mj_name2id(
+                self.model, self.mujoco.mjtObj.mjOBJ_GEOM, name
+            )
+            if geom_id >= 0:
+                geom_ids.append(int(geom_id))
+                continue
+            body_id = self.mujoco.mj_name2id(
+                self.model, self.mujoco.mjtObj.mjOBJ_BODY, name
+            )
+            if body_id < 0:
+                raise ValueError(f"PND collision label {name!r} is neither a geom nor body")
+            geom_ids.extend(np.flatnonzero(self.model.geom_bodyid == body_id).tolist())
+        if not geom_ids:
+            raise ValueError(f"PND collision group {tuple(names)!r} contains no geometry")
+        return tuple(geom_ids)
+
+    def _limits(self, side: str):
+        limits = [self.mink.ConfigurationLimit(self.model)]
+        if self.collision_avoidance:
+            collision_groups = (
+                (
+                    ("wristYawLeft", "wristYawRight", "shoulderYawLeft", "shoulderYawRight"),
+                    ("torso",),
+                ),
+                (("wristYawLeft",), ("wristYawRight",)),
+            )
+            try:
+                limits.extend(
+                    self.mink.CollisionAvoidanceLimit(
+                        self.model,
+                        geom_pairs=[
+                            (self._geom_group(pair[0]), self._geom_group(pair[1]))
+                        ],
+                        minimum_distance_from_collisions=0.02,
+                        collision_detection_distance=0.03,
+                    )
+                    for pair in collision_groups
+                )
+            except (KeyError, ValueError) as exc:
+                raise ValueError(
+                    "PND collision geometry groups do not match this MJCF; "
+                    "use the official pnd_models/adam_u/adam_u.xml"
+                ) from exc
+
+        # PND enables 10 rad/s for shoulder pitch/roll and elbow and leaves
+        # yaw/wrist entries commented.  We enable the documented 10/9 values
+        # for the complete active arm, while freezing the opposite arm.
+        velocity = {}
+        active_names = set(self._arm_names[side])
+        for joint_id in range(self.model.njnt):
+            if self.model.jnt_type[joint_id] == self.mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            name = self.mujoco.mj_id2name(
+                self.model, self.mujoco.mjtObj.mjOBJ_JOINT, joint_id
+            )
+            if not name:
+                continue
+            # Right-arm-only teleoperation must not let the internal QP solve
+            # through an uncommanded waist, neck, hand, or opposite arm.
+            velocity[name] = (
+                (9.0 if name.startswith("wrist") else 10.0)
+                if name in active_names
+                else 1e-6
+            )
+        limits.append(self.mink.VelocityLimit(self.model, velocity))
+        return limits
+
+    def _new_state(self, side: str, env_index: int, current: np.ndarray, measured_pose: np.ndarray):
+        configuration = self.mink.Configuration(self.model)
+        for arm_name, value in zip(self._arm_names[side], current, strict=True):
+            configuration.data.qpos[self._qpos_indices[arm_name]] = float(value)
+        self.mujoco.mj_forward(self.model, configuration.data)
+        body_name = "wristRollLeft" if side == "left" else "wristRollRight"
+        body_id = self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_BODY, body_name)
+        mink_pos = configuration.data.xpos[body_id].copy()
+        mink_quat_wxyz = configuration.data.xquat[body_id].copy()
+        from scipy.spatial.transform import Rotation
+
+        mink_rot = Rotation.from_quat(mink_quat_wxyz, scalar_first=True).as_matrix()
+        isaac_rot = _rot6d_to_matrix_np(measured_pose[3:])
+        rotation_mink_from_isaac = mink_rot @ isaac_rot.T
+        translation_mink_from_isaac = mink_pos - rotation_mink_from_isaac @ measured_pose[:3]
+        task = self.mink.FrameTask(
+            frame_name=body_name,
+            frame_type="body",
+            position_cost=self.PND_WRIST_POSITION_COST,
+            orientation_cost=self.PND_WRIST_ORIENTATION_COST,
+            lm_damping=self.PND_LM_DAMPING,
+        )
+        state = {
+            "configuration": configuration,
+            "task": task,
+            "limits": self._limits(side),
+            "R_mi": rotation_mink_from_isaac,
+            "t_mi": translation_mink_from_isaac,
+        }
+        self._states[(side, env_index)] = state
+        return state
+
+    def solve(self, side, eef_command_9d, current_arm, *, command_is_relative):
+        from scipy.spatial.transform import Rotation
+
+        if command_is_relative:
+            raise ValueError("Mink backend expects persistent absolute Cartesian targets")
+        command = np.asarray(eef_command_9d, dtype=np.float64)
+        current = np.asarray(current_arm, dtype=np.float64)
+        if command.ndim != 2 or command.shape[1] != 9 or current.shape != (command.shape[0], 7):
+            raise ValueError("Mink IK expects EEF[batch,9] and arm[batch,7]")
+        if not np.all(np.isfinite(command)) or not np.all(np.isfinite(current)):
+            raise ValueError("Mink IK rejected NaN or infinite input")
+        measured_pose, _ = self.provider(side, current)
+        results = []
+        for env_index in range(command.shape[0]):
+            state = self._states.get((side, env_index))
+            if state is None:
+                state = self._new_state(side, env_index, current[env_index], measured_pose[env_index])
+            configuration = state["configuration"]
+            state["task"].set_orientation_cost(
+                self._translation_orientation_cost
+                if self._translation_priority
+                else self.PND_WRIST_ORIENTATION_COST
+            )
+            target_rot_i = _rot6d_to_matrix_np(command[env_index, 3:])
+            target_pos_m = state["R_mi"] @ command[env_index, :3] + state["t_mi"]
+            target_rot_m = state["R_mi"] @ target_rot_i
+            if self.apply_controller_frame_offset:
+                offset = Rotation.from_quat(
+                    self.PND_WRIST_OFFSET_WXYZ, scalar_first=True
+                ).as_matrix()
+                target_rot_m = target_rot_m @ offset
+            target_quat = Rotation.from_matrix(target_rot_m).as_quat(scalar_first=True)
+            state["task"].set_target(
+                self.mink.SE3.from_rotation_and_translation(
+                    self.mink.SO3(target_quat), target_pos_m
+                )
+            )
+            q_before = np.asarray(
+                [
+                    configuration.data.qpos[self._qpos_indices[n]]
+                    for n in self._arm_names[side]
+                ],
+                dtype=np.float64,
+            )
+            for _ in range(self.iterations):
+                velocity = self.mink.solve_ik(
+                    configuration,
+                    (state["task"],),
+                    self.model.opt.timestep,
+                    solver=self.qp_solver,
+                    damping=self.damping,
+                    limits=state["limits"],
+                    safety_break=False,
+                )
+                configuration.integrate_inplace(velocity, self.model.opt.timestep)
+            raw = np.asarray(
+                [configuration.data.qpos[self._qpos_indices[n]] for n in self._arm_names[side]]
+            )
+            # Advance from Mink's persistent commanded state, not from the
+            # gravity-sagged measured state. Rebasing on q_measured capped the
+            # actuator lead at max_joint_delta forever, so the arm could not
+            # generate enough PD effort to follow vertical keyboard commands.
+            target = q_before + np.clip(
+                raw - q_before, -self.max_joint_delta, self.max_joint_delta
+            )
+            if self.max_commanded_joint_error is not None:
+                target = current[env_index] + np.clip(
+                    target - current[env_index],
+                    -self.max_commanded_joint_error,
+                    self.max_commanded_joint_error,
+                )
+            results.append(target)
+        result = np.asarray(results, dtype=np.float32)
+        if not np.all(np.isfinite(result)):
+            raise ValueError("Mink IK produced a non-finite arm target")
+        return result
+
+    def set_translation_priority(
+        self, active: bool, *, orientation_cost: float | None = None
+    ) -> None:
+        """Soften wrist orientation while the operator requests XYZ motion."""
+        if orientation_cost is not None:
+            if orientation_cost < 0:
+                raise ValueError("Translation orientation cost must be non-negative")
+            self._translation_orientation_cost = float(orientation_cost)
+        self._translation_priority = bool(active)
+
+    def gravity_compensation(self, side: str, current_arm: np.ndarray) -> np.ndarray:
+        """Return MJCF gravity/bias torques for the active Adam-U arm."""
+        current = np.asarray(current_arm, dtype=np.float64)
+        if current.ndim != 2 or current.shape[1] != 7 or not np.all(np.isfinite(current)):
+            raise ValueError("Gravity compensation expects finite arm[batch,7]")
+        efforts = []
+        for arm in current:
+            data = self.mujoco.MjData(self.model)
+            for name, value in zip(self._arm_names[side], arm, strict=True):
+                data.qpos[self._qpos_indices[name]] = float(value)
+            self.mujoco.mj_forward(self.model, data)
+            torque = []
+            for name in self._arm_names[side]:
+                joint_id = self.mujoco.mj_name2id(
+                    self.model, self.mujoco.mjtObj.mjOBJ_JOINT, name
+                )
+                dof_id = int(self.model.jnt_dofadr[joint_id])
+                torque.append(float(data.qfrc_bias[dof_id]))
+            efforts.append(torque)
+        result = np.asarray(efforts, dtype=np.float32)
+        # Match Adam-U actuator capabilities; Isaac applies its own final cap.
+        limits = np.asarray((40.0, 40.0, 40.0, 30.0, 6.4, 6.4, 6.4), dtype=np.float32)
+        return np.clip(result, -limits, limits)
+
+    def sync_commanded_joint_pos(self, side: str, commanded_joint_pos: np.ndarray) -> None:
+        values = np.asarray(commanded_joint_pos, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != 7 or not np.all(np.isfinite(values)):
+            raise ValueError("Synchronized IK joint target must be finite with shape (batch, 7)")
+        # Preserve Cartesian frame calibration, but synchronize the persistent
+        # Mink configuration to the command actually accepted by Isaac.
+        for env_index, arm in enumerate(values):
+            state = self._states.get((side, env_index))
+            if state is None:
+                continue
+            for name, value in zip(self._arm_names[side], arm, strict=True):
+                state["configuration"].data.qpos[self._qpos_indices[name]] = float(value)
+            self.mujoco.mj_forward(self.model, state["configuration"].data)
+
+
 class PinocchioAdamUKinematicsProvider(IsaacAdamUKinematicsProvider):
     """Adam-U FK pose from Isaac plus an independent URDF Jacobian in world axes.
 

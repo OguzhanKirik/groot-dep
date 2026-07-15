@@ -39,8 +39,24 @@ parser.add_argument("--teleop-device", choices=("keyboard", "spacemouse"), defau
 parser.add_argument("--output", default="logs/teleop/adam_u_demos.hdf5")
 parser.add_argument("--task", default="pick up the cube and place it on the green target")
 parser.add_argument("--max-steps", type=int, default=100000)
-parser.add_argument("--position-sensitivity", type=float, default=0.002, help="Metres per simulation step while a motion key is held.")
-parser.add_argument("--z-sensitivity-scale", type=float, default=1.5, help="Additional world-Z gain applied to Q/E translation.")
+parser.add_argument(
+    "--startup-stabilization-steps",
+    type=int,
+    default=60,
+    help="Ignore teleop motion while the arm settles into its initial target.",
+)
+parser.add_argument(
+    "--translation-self-test",
+    action="store_true",
+    help="Automatically exercise W/S/A/D/Q/E-equivalent world-axis commands and exit.",
+)
+parser.add_argument(
+    "--translation-self-test-keys",
+    default="WSADQE",
+    help="Subset/order of WSADQE used by --translation-self-test.",
+)
+parser.add_argument("--position-sensitivity", type=float, default=0.001, help="Metres per simulation step while a motion key is held.")
+parser.add_argument("--z-sensitivity-scale", type=float, default=2.0, help="Additional world-Z gain applied to Q/E translation.")
 parser.add_argument(
     "--axis-locked-translation",
     action=argparse.BooleanOptionalAction,
@@ -48,8 +64,41 @@ parser.add_argument(
     help="While jogging XYZ, rebase non-commanded axes to the measured wrist position.",
 )
 parser.add_argument("--rotation-sensitivity", type=float, default=0.01, help="Radians per simulation step while a rotation key is held.")
-parser.add_argument("--ik-joint-step", type=float, default=0.005)
-parser.add_argument("--ik-backend", choices=("isaac", "pink"), default="isaac")
+parser.add_argument("--ik-joint-step", type=float, default=0.03)
+parser.add_argument("--ik-backend", choices=("isaac", "mink", "pink"), default="isaac")
+parser.add_argument(
+    "--mink-model",
+    default=os.environ.get(
+        "ADAM_U_MINK_MODEL",
+        os.path.join(_REPO_ROOT, "third_party", "pnd_models", "adam_u", "adam_u.xml"),
+    ),
+    help="PND's official Adam-U MJCF used only for host-side Mink kinematics.",
+)
+parser.add_argument("--mink-damping", type=float, default=0.01)
+parser.add_argument("--mink-iterations", type=int, default=3)
+parser.add_argument(
+    "--mink-translation-orientation-cost",
+    type=float,
+    default=0.0,
+    help="Soft wrist-orientation cost while an XYZ key is held; PND's 18 is restored afterward.",
+)
+parser.add_argument(
+    "--mink-controller-frame-offset",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Apply PND's [0.866,0,-0.5,0] WXYZ tracker-to-wrist offset. Keep off for direct wrist poses.",
+)
+parser.add_argument(
+    "--mink-collision-avoidance",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+)
+parser.add_argument(
+    "--mink-gravity-compensation",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Apply official-MJCF gravity torque as feed-forward effort in Isaac.",
+)
 parser.add_argument("--pink-position-cost", type=float, default=1.0)
 parser.add_argument("--pink-orientation-cost", type=float, default=0.25)
 parser.add_argument("--pink-posture-cost", type=float, default=0.001)
@@ -57,8 +106,8 @@ parser.add_argument("--pink-damping", type=float, default=1e-6)
 parser.add_argument("--pink-qp-solver", choices=("daqp", "osqp"), default="daqp")
 parser.add_argument("--max-eef-error", type=float, default=0.08, help="Maximum target-to-measured wrist distance in metres.")
 parser.add_argument("--max-joint-lead", type=float, default=0.10, help="Maximum persistent IK target lead over a measured joint in radians.")
-parser.add_argument("--joint-target-smoothing", type=float, default=0.35, help="EMA weight for each new IK joint target (0, 1].")
-parser.add_argument("--max-joint-target-step", type=float, default=0.01, help="Maximum commanded joint-target change per simulation step in radians.")
+parser.add_argument("--joint-target-smoothing", type=float, default=1.0, help="EMA weight for each new IK joint target (0, 1].")
+parser.add_argument("--max-joint-target-step", type=float, default=0.03, help="Maximum commanded joint-target change per simulation step in radians.")
 parser.add_argument("--workspace-min", type=float, nargs=3, default=(-0.85, -0.50, 0.72))
 parser.add_argument("--workspace-max", type=float, nargs=3, default=(-0.08, 0.50, 1.55))
 parser.add_argument(
@@ -164,12 +213,18 @@ from isaaclab.envs import ManagerBasedEnv
 from adapters.adam_u_action_adapter import expand_hand_synergies_for_isaac
 from adapters.eef_pose import (
     IsaacDifferentialIKSolver,
+    MinkAdamUIKSolver,
     PinocchioAdamUKinematicsProvider,
     PinkAdamUIKSolver,
 )
 from adapters.teleop_recorder import AdamUTeleopRecorder
 from configs.adam_u_action_mapping import AdamUActionMappingConfig
-from configs.joint_state import BODY_JOINT_NAMES, LEFT_HAND_JOINT_NAMES, RIGHT_HAND_JOINT_NAMES
+from configs.joint_state import (
+    BODY_JOINT_NAMES,
+    LEFT_HAND_JOINT_NAMES,
+    RIGHT_ARM_JOINT_NAMES,
+    RIGHT_HAND_JOINT_NAMES,
+)
 from envs.scene_layout import FRONT_CAMERA_LOOKAT, FRONT_CAMERA_POS, VIEWER_EYE, VIEWER_LOOKAT
 
 # Adam-U's mesh-heavy URDF invalidates the first PhysX tensor view on this
@@ -268,6 +323,8 @@ def main() -> None:
         raise ValueError("--joint-target-smoothing must be in (0, 1]")
     if args_cli.max_joint_target_step <= 0:
         raise ValueError("--max-joint-target-step must be positive")
+    if args_cli.startup_stabilization_steps < 0:
+        raise ValueError("--startup-stabilization-steps must be non-negative")
     if (
         args_cli.pink_position_cost <= 0
         or args_cli.pink_orientation_cost < 0
@@ -275,6 +332,12 @@ def main() -> None:
         or args_cli.pink_damping < 0
     ):
         raise ValueError("Pink costs/damping must be non-negative and position cost positive")
+    if (
+        args_cli.mink_damping < 0
+        or args_cli.mink_iterations < 1
+        or args_cli.mink_translation_orientation_cost < 0
+    ):
+        raise ValueError("Mink damping must be non-negative and iterations positive")
     if (
         args_cli.scripted_hold_steps < 1
         or args_cli.scripted_close_steps < 1
@@ -344,7 +407,26 @@ def main() -> None:
     env.sim.render()
 
     provider = PinocchioAdamUKinematicsProvider(env)
-    if args_cli.ik_backend == "pink":
+    if args_cli.ik_backend == "mink":
+        solver = MinkAdamUIKSolver(
+            provider,
+            args_cli.mink_model,
+            max_joint_delta=args_cli.ik_joint_step,
+            max_commanded_joint_error=args_cli.max_joint_lead,
+            damping=args_cli.mink_damping,
+            iterations=args_cli.mink_iterations,
+            apply_controller_frame_offset=args_cli.mink_controller_frame_offset,
+            collision_avoidance=args_cli.mink_collision_avoidance,
+        )
+        print(
+            "[TELEOP] IK backend=Mink/DAQP with PND Adam-U tuning; "
+            f"model={os.path.abspath(os.path.expanduser(args_cli.mink_model))}, "
+            f"costs position={solver.PND_WRIST_POSITION_COST}, "
+            f"orientation={solver.PND_WRIST_ORIENTATION_COST}, "
+            f"damping={args_cli.mink_damping}, iterations={args_cli.mink_iterations}, "
+            f"controller_frame_offset={args_cli.mink_controller_frame_offset}"
+        )
+    elif args_cli.ik_backend == "pink":
         solver = PinkAdamUIKSolver(
             provider,
             max_joint_delta=args_cli.ik_joint_step,
@@ -414,13 +496,14 @@ def main() -> None:
             - _numpy(env.scene.env_origins)[0]
         )
         startup_grasp_center = startup_cube.copy()
-        startup_grasp_center[2] += 0.5 * args_cli.scripted_cube_size + 0.10
+        startup_grasp_center[2] += 0.5 * args_cli.scripted_cube_size + 0.15
         target_rotation = _adam_right_palm_down_rotation()
         target_position = startup_grasp_center - target_rotation @ grasp_frame_offset
         print(
-            "[TELEOP] Startup preset: palm-down grasp center 10 cm above cube surface "
+            "[TELEOP] Startup preset: palm-down grasp center 15 cm above cube surface "
             f"at {startup_grasp_center}"
         )
+    manual_palm_position = target_position + target_rotation @ grasp_frame_offset
     solver.sync_commanded_joint_pos("right", current_right)
     previous_right_target = current_right.copy()
 
@@ -502,11 +585,35 @@ def main() -> None:
 
     print(teleop)
     print("[TELEOP] K/button: toggle hand | P: pause | R: discard/reset | ENTER: save success")
-    print("[TELEOP] All translation and rotation keys update one 6D wrist target; IK drives all 7 arm joints")
+    print("[TELEOP] Keys update one 6D palm-center target; it is converted to wristRollRight for IK")
+    print("[TELEOP] Click once inside the Isaac simulation viewport before using the keyboard")
     if args_cli.scripted_grasp:
         print("[SCRIPTED] Automatic six-waypoint grasp collection enabled; R aborts/restarts")
     print(f"[TELEOP] Recording native Adam-U demonstrations to {output}")
     step = 0
+    input_was_active = False
+    translation_was_active = False
+    manual_pose_was_active = False
+    all_translation_test_cases = (
+        ("W", np.asarray((1.0, 0.0, 0.0), dtype=np.float32)),
+        ("S", np.asarray((-1.0, 0.0, 0.0), dtype=np.float32)),
+        ("A", np.asarray((0.0, 1.0, 0.0), dtype=np.float32)),
+        ("D", np.asarray((0.0, -1.0, 0.0), dtype=np.float32)),
+        ("Q", np.asarray((0.0, 0.0, 1.0), dtype=np.float32)),
+        ("E", np.asarray((0.0, 0.0, -1.0), dtype=np.float32)),
+    )
+    invalid_test_keys = set(args_cli.translation_self_test_keys) - set("WSADQE")
+    if invalid_test_keys or not args_cli.translation_self_test_keys:
+        raise ValueError("--translation-self-test-keys must be a non-empty subset of WSADQE")
+    cases_by_key = dict(all_translation_test_cases)
+    translation_test_cases = tuple(
+        (key, cases_by_key[key]) for key in args_cli.translation_self_test_keys
+    )
+    translation_test_index = 0
+    translation_test_step = 0
+    translation_test_start = None
+    translation_test_joint_start = None
+    translation_test_results = []
     while simulation_app.is_running() and step < args_cli.max_steps:
         started = time.time()
         if signals.save:
@@ -535,18 +642,49 @@ def main() -> None:
                     - _numpy(env.scene.env_origins)[0]
                 )
                 startup_grasp_center = startup_cube.copy()
-                startup_grasp_center[2] += 0.5 * args_cli.scripted_cube_size + 0.10
+                startup_grasp_center[2] += 0.5 * args_cli.scripted_cube_size + 0.15
                 target_rotation = _adam_right_palm_down_rotation()
                 target_position = startup_grasp_center - target_rotation @ grasp_frame_offset
+            manual_palm_position = target_position + target_rotation @ grasp_frame_offset
             solver.sync_commanded_joint_pos("right", current_right)
             previous_right_target = current_right.copy()
+            translation_was_active = False
+            manual_pose_was_active = False
             reset_scripted_state()
             print("[TELEOP] Episode discarded/reset")
 
         command = _numpy(teleop.advance()).reshape(-1).copy()
+        input_is_active = bool(np.any(np.abs(command) > 1e-9))
+        if input_is_active and not input_was_active:
+            print(
+                "[TELEOP INPUT] received "
+                f"translation={command[:3]} rotation={command[3:6]} "
+                f"gripper={command[6]:+.1f}"
+            )
+        input_was_active = input_is_active
         current_body = _ordered_joint_positions(robot, BODY_JOINT_NAMES)
         measured_pose_before, _ = provider("right", current_body[:, 12:19])
         measured_rotation_before = _matrix_from_pose9(measured_pose_before[0])
+        translation_is_active = False
+        stabilizing = step < args_cli.startup_stabilization_steps
+        if stabilizing:
+            command[:6] = 0.0
+        elif step == args_cli.startup_stabilization_steps:
+            print("[TELEOP] Startup stabilization complete; manual XYZ control enabled")
+        if args_cli.translation_self_test and not stabilizing:
+            command[:6] = 0.0
+            key, axis = translation_test_cases[translation_test_index]
+            if translation_test_step == 0:
+                translation_test_start = measured_pose_before[0, :3].copy()
+                translation_test_joint_start = current_body[0, 12:19].copy()
+                translation_was_active = False
+                manual_pose_was_active = False
+                print(
+                    f"[TRANSLATION TEST] {key} start={translation_test_start} "
+                    f"requested_axis={axis}"
+                )
+            if translation_test_step < 30:
+                command[:3] = axis * args_cli.position_sensitivity
         if args_cli.scripted_grasp and not signals.paused and not scripted_done:
             scripted_contact_center_error = 0.0
             grasp_goal_position, goal_rotation, phase_name = scripted_waypoints[scripted_phase]
@@ -684,24 +822,62 @@ def main() -> None:
             # world-Z gain because gravity and the arm configuration make the
             # vertical response weaker than equal-sized X/Y increments.
             command[2] *= args_cli.z_sensitivity_scale
-            if args_cli.axis_locked_translation and np.any(np.abs(command[:3]) > 1e-9):
+            translation_is_active = bool(np.any(np.abs(command[:3]) > 1e-9))
+            rotation_is_active = bool(np.any(np.abs(command[3:6]) > 1e-9))
+            manual_pose_is_active = translation_is_active or rotation_is_active
+            measured_palm_position = (
+                measured_pose_before[0, :3]
+                + measured_rotation_before @ grasp_frame_offset
+            )
+            if manual_pose_is_active and not manual_pose_was_active:
+                # Take over at the visible palm pose, not at wristRollRight.
+                # This also clears any unfinished startup target and stale
+                # actuator-filter state before a new keyboard gesture.
+                manual_palm_position = measured_palm_position.copy()
+                target_rotation = measured_rotation_before.copy()
+                measured_right = current_body[:, 12:19].astype(np.float32)
+                solver.sync_commanded_joint_pos("right", measured_right)
+                previous_right_target = measured_right.copy()
+                print(
+                    "[TELEOP] Manual palm-pose takeover latched at "
+                    f"{manual_palm_position}"
+                )
+            if args_cli.axis_locked_translation and translation_is_active:
                 active_translation_axes = np.abs(command[:3]) > 1e-9
-                # Remove residual targets on axes the user is not commanding.
-                # Without this, IK may keep correcting an old X/Y/Z error and
-                # make a single-axis keyboard jog appear diagonal.
-                target_position[~active_translation_axes] = measured_pose_before[
-                    0, :3
-                ][~active_translation_axes]
-            target_position += command[:3]
-            target_position = np.clip(target_position, workspace_min, workspace_max)
-            # Device rotation increments are applied about world axes to the
-            # persistent absolute Adam-U wrist orientation target.
-            target_rotation = Rotation.from_rotvec(command[3:6]).as_matrix() @ target_rotation
+                if manual_pose_was_active:
+                    # During a held key, preserve progress only on the active
+                    # axis and eliminate cross-axis drift each frame.
+                    manual_palm_position[~active_translation_axes] = measured_palm_position[
+                        ~active_translation_axes
+                    ]
+            manual_palm_position += command[:3]
+            manual_palm_position = np.clip(
+                manual_palm_position, workspace_min, workspace_max
+            )
+            # Rotation keys are tool-local roll/pitch/yaw. Right multiplication
+            # is essential: at a palm-down pose the wrist-roll axis is not
+            # world X, and world-axis rotation makes Mink recruit the shoulder.
+            target_rotation = target_rotation @ Rotation.from_rotvec(
+                command[3:6]
+            ).as_matrix()
+            # IK controls wristRollRight, so compensate the palm/tool offset.
+            # Keeping the palm target fixed while orientation changes makes
+            # rotations occur about the palm rather than the wrist or shoulder.
+            target_position = (
+                manual_palm_position - target_rotation @ grasp_frame_offset
+            )
+            translation_was_active = translation_is_active
+            manual_pose_was_active = manual_pose_is_active
         target_offset = target_position - measured_pose_before[0, :3]
         target_distance = float(np.linalg.norm(target_offset))
         if target_distance > args_cli.max_eef_error:
             target_position = measured_pose_before[0, :3] + target_offset * (
                 args_cli.max_eef_error / target_distance
+            )
+        if isinstance(solver, MinkAdamUIKSolver):
+            solver.set_translation_priority(
+                translation_is_active,
+                orientation_cost=args_cli.mink_translation_orientation_cost,
             )
         raw_right_target = solver.solve(
             "right", _pose9(target_position, target_rotation)[None], current_body[:, 12:19],
@@ -741,11 +917,52 @@ def main() -> None:
             hand_action[:, 6:12] = 0.0 if command[6] > 0 else hand_upper[6:12]
         hand_action = np.clip(hand_action, 0.0, hand_upper).astype(np.float32)
         sim_action = np.concatenate((body_action, expand_hand_synergies_for_isaac(hand_action)), axis=1)
+        if isinstance(solver, MinkAdamUIKSolver) and args_cli.mink_gravity_compensation:
+            gravity_effort = solver.gravity_compensation("right", current_body[:, 12:19])
+            right_joint_ids = [
+                robot.data.joint_names.index(name) for name in RIGHT_ARM_JOINT_NAMES
+            ]
+            robot.set_joint_effort_target_index(
+                target=torch.as_tensor(
+                    gravity_effort, device=env.device, dtype=torch.float32
+                ),
+                joint_ids=right_joint_ids,
+            )
         env.step(torch.as_tensor(sim_action, device=env.device, dtype=torch.float32))
 
         measured_body = _ordered_joint_positions(robot, BODY_JOINT_NAMES)[0]
         measured_hands = _hand_synergies(robot)[0]
         measured_wrist, _ = provider("right", measured_body[None, 12:19])
+        if args_cli.translation_self_test and not stabilizing:
+            key, axis = translation_test_cases[translation_test_index]
+            if translation_test_step == 29:
+                displacement = measured_wrist[0, :3] - translation_test_start
+                measured_joint_delta = measured_body[12:19] - translation_test_joint_start
+                commanded_joint_delta = body_action[0, 12:19] - translation_test_joint_start
+                along = float(np.dot(displacement, axis))
+                cross = float(np.linalg.norm(displacement - along * axis))
+                passed = along > 0.003
+                translation_test_results.append((key, along, cross, passed))
+                print(
+                    f"[TRANSLATION TEST] {key} displacement={displacement} "
+                    f"dq_command={np.round(commanded_joint_delta, 5).tolist()} "
+                    f"dq_measured={np.round(measured_joint_delta, 5).tolist()} "
+                    f"along={along:.5f}m cross={cross:.5f}m "
+                    f"result={'PASS' if passed else 'FAIL'}"
+                )
+            translation_test_step += 1
+            if translation_test_step >= 40:
+                translation_test_step = 0
+                translation_test_index += 1
+                translation_was_active = False
+                if translation_test_index >= len(translation_test_cases):
+                    print("[TRANSLATION TEST] summary:")
+                    for key_name, along, cross, passed in translation_test_results:
+                        print(
+                            f"  {key_name}: along={along:.5f}m cross={cross:.5f}m "
+                            f"{'PASS' if passed else 'FAIL'}"
+                        )
+                    break
         object_position = _numpy(env.scene["object"].data.root_pos_w)[0] - _numpy(env.scene.env_origins)[0]
         object_quat = _numpy(env.scene["object"].data.root_quat_w)[0]
         sample = {
